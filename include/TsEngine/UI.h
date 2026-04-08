@@ -49,7 +49,7 @@ private:
     void cmdSearch(const std::string& arg);
     void cmdStatus();
 
-    void ensureAttached();
+    bool ensureAttached();
     void printColor(const char* color, const char* fmt, ...);
     void pollWatchHits();
 
