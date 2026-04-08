@@ -77,6 +77,25 @@ static std::string stripAnsi(const std::string& s) {
     return out;
 }
 
+// ── 判断字符串是否像 hex 地址 (支持 0x1234 和纯 1234abcd) ──
+static bool looksLikeHexAddr(const std::string& s) {
+    if (s.empty()) return false;
+    size_t start = 0;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) start = 2;
+    if (start >= s.size()) return false;
+    for (size_t i = start; i < s.size(); i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    }
+    return true;
+}
+
+// 解析 hex 地址 (自动加 0x 前缀)
+static addr_t parseHexAddr(const std::string& s) {
+    return untag(std::stoull(s, nullptr, 16));
+}
+
 // ── 分隔线 ──
 static void line(const char* color = D, int len = 44) {
     fputs(color, stdout);
@@ -1621,9 +1640,8 @@ void UI::cmdCall(const std::string& arg) {
     // 解析函数地址
     addr_t funcAddr = 0;
     std::string funcName;
-    bool isAddr = (addrStr.size() > 2 && addrStr[0] == '0' && (addrStr[1] == 'x' || addrStr[1] == 'X'));
-    if (isAddr) {
-        try { funcAddr = untag(std::stoull(addrStr, nullptr, 16)); } catch (...) {
+    if (looksLikeHexAddr(addrStr)) {
+        try { funcAddr = parseHexAddr(addrStr); } catch (...) {
             printf("\n  " R "x" RST " 地址格式错误\n\n"); return;
         }
         funcName = syms_.resolve(funcAddr);
@@ -1788,9 +1806,8 @@ void UI::cmdHook(const std::string& arg) {
 
     // hook <地址|函数名> <动作>
     addr_t target = 0;
-    bool isSub = (sub.size() > 2 && sub[0] == '0' && (sub[1] == 'x' || sub[1] == 'X'));
-    if (isSub) {
-        try { target = untag(std::stoull(sub, nullptr, 16)); } catch (...) {
+    if (looksLikeHexAddr(sub)) {
+        try { target = parseHexAddr(sub); } catch (...) {
             printf("\n  " R "x" RST " 地址格式错误\n\n"); return;
         }
     } else {
