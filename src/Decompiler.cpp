@@ -147,49 +147,94 @@ static bool parseCondBranch(const std::string& code, CondBrInfo& out) {
 
 // ── Peephole 优化 ──
 
+// 检查 code 是否是 "REG = #HEXADDR;  // addr" 模式, 提取 REG 和 ADDR
+struct AdrpInfo { std::string reg; addr_t addr; };
+static bool parseAdrpLine(const std::string& code, const std::string& comment, AdrpInfo& out) {
+    if (comment.find("addr") == std::string::npos && code.find("// addr") == std::string::npos) return false;
+    auto eq = code.find(" = ");
+    if (eq == std::string::npos) return false;
+    out.reg = code.substr(0, eq);
+    std::string rhs = code.substr(eq + 3);
+    if (!rhs.empty() && rhs.back() == ';') rhs.pop_back();
+    // 去掉 "// addr" 后缀
+    auto cm = rhs.find("  //");
+    if (cm != std::string::npos) rhs = rhs.substr(0, cm);
+    while (!rhs.empty() && rhs.back() == ' ') rhs.pop_back();
+    if (rhs.empty() || rhs[0] != '#') return false;
+    try { out.addr = std::stoull(rhs.substr(1), nullptr, 16); return true; } catch (...) { return false; }
+}
+
+// 检查 "REG += OFFSET;" 模式
+struct AddInfo { std::string reg; addr_t offset; };
+static bool parseAddAssign(const std::string& code, AddInfo& out) {
+    auto pos = code.find(" += ");
+    if (pos == std::string::npos) return false;
+    out.reg = code.substr(0, pos);
+    std::string rhs = code.substr(pos + 4);
+    if (!rhs.empty() && rhs.back() == ';') rhs.pop_back();
+    while (!rhs.empty() && rhs.back() == ' ') rhs.pop_back();
+    try { out.offset = std::stoull(rhs, nullptr, 0); return true; } catch (...) { return false; }
+}
+
+// 检查函数调用行: "funcname();" 且 comment 含字符串
+static bool isCallLine(const std::string& code) {
+    return code.find("();") != std::string::npos && code.find("goto") == std::string::npos;
+}
+
+// 从 switch 候选行提取: "if (VAR == N) goto ADDR;"
+struct SwitchCase { std::string var; std::string val; std::string target; };
+static bool parseSwitchCase(const std::string& code, SwitchCase& out) {
+    if (code.find("if (") != 0) return false;
+    auto eqPos = code.find(" == ");
+    if (eqPos == std::string::npos) return false;
+    auto closeP = code.find(") goto ");
+    if (closeP == std::string::npos) return false;
+    out.var = code.substr(4, eqPos - 4);
+    out.val = code.substr(eqPos + 4, closeP - eqPos - 4);
+    auto semi = code.find(';', closeP);
+    if (semi == std::string::npos) return false;
+    out.target = code.substr(closeP + 7, semi - closeP - 7);
+    return true;
+}
+
 static void optimizeLines(std::vector<DecompileLine>& lines) {
-    std::vector<DecompileLine> out;
-    out.reserve(lines.size());
+    // ── Pass 1: 基础合并 (在 lines 上就地修改, 标记删除) ──
+    std::vector<bool> deleted(lines.size(), false);
 
     for (size_t i = 0; i < lines.size(); i++) {
+        if (deleted[i]) continue;
         auto& cur = lines[i];
-        bool hasNext = (i + 1 < lines.size());
+        bool hasNext = (i + 1 < lines.size() && !deleted[i + 1]);
 
         // ─ Pattern 1: 去除 fallthrough goto ─
-        // "goto #ADDR;" 且下一行地址就是 ADDR → 跳过
         if (hasNext && cur.code.find("goto ") == 0 && cur.code.find("goto *") != 0) {
             addr_t target = parseGotoAddr(cur.code);
             if (target != 0 && target == lines[i + 1].address) {
-                continue; // 删掉这行
+                deleted[i] = true; continue;
             }
         }
 
         // ─ Pattern 2: subs + 条件分支 → if (var OP imm) goto ─
-        // "v8 = v8 - N;  // sets flags" + "if (eq) goto ADDR;" → "if (v8 == N) goto ADDR;"
         if (hasNext) {
             SubsInfo si;
             CondBrInfo bi;
             if (parseSubsLine(cur.code, si) && parseCondBranch(lines[i + 1].code, bi)) {
                 std::string op = condToOp(bi.cond);
-                std::string merged = "if (" + si.var + " " + op + " " + si.imm + ") goto " + bi.target + ";";
-                // 保留第二行 (条件分支), 替换内容, 删第一行
-                lines[i + 1].code = merged;
+                lines[i + 1].code = "if (" + si.var + " " + op + " " + si.imm + ") goto " + bi.target + ";";
                 if (cur.isTarget) lines[i + 1].isTarget = true;
-                continue; // 跳过 subs 行
+                deleted[i] = true; continue;
             }
         }
 
         // ─ Pattern 3: cmp + 条件分支 → if (X OP Y) goto ─
-        // "if (X cmp Y)" + "if (eq) goto ADDR;" → "if (X == Y) goto ADDR;"
         if (hasNext) {
             CmpInfo ci;
             CondBrInfo bi;
             if (parseCmpLine(cur.code, ci) && parseCondBranch(lines[i + 1].code, bi)) {
                 std::string op = condToOp(bi.cond);
-                std::string merged = "if (" + ci.lhs + " " + op + " " + ci.rhs + ") goto " + bi.target + ";";
-                lines[i + 1].code = merged;
+                lines[i + 1].code = "if (" + ci.lhs + " " + op + " " + ci.rhs + ") goto " + bi.target + ";";
                 if (cur.isTarget) lines[i + 1].isTarget = true;
-                continue;
+                deleted[i] = true; continue;
             }
         }
 
@@ -201,9 +246,122 @@ static void optimizeLines(std::vector<DecompileLine>& lines) {
             }
         }
 
-        out.push_back(std::move(cur));
+        // ─ Pattern 5: adrp+add 合并 ─
+        // "reg = #ADDR;  // addr" + "reg += OFFSET;" → "reg = #(ADDR+OFFSET);  // addr"
+        if (hasNext) {
+            AdrpInfo ai;
+            AddInfo di;
+            if (parseAdrpLine(cur.code, cur.comment, ai) && parseAddAssign(lines[i + 1].code, di) && ai.reg == di.reg) {
+                char buf[64]; snprintf(buf, sizeof(buf), "%s = #0x%lx;", ai.reg.c_str(), (unsigned long)(ai.addr + di.offset));
+                lines[i + 1].code = buf;
+                lines[i + 1].comment = "addr";
+                if (cur.isTarget) lines[i + 1].isTarget = true;
+                deleted[i] = true; continue;
+            }
+        }
     }
 
+    // ── Pass 2: 函数调用内联字符串参数 ──
+    // "arg0 = #ADDR;  // addr" + "func();  // "string"" → "func("string");"
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (deleted[i]) continue;
+        // 找 call 行 (有字符串注释)
+        if (!isCallLine(lines[i].code)) continue;
+        if (lines[i].comment.empty() || lines[i].comment[0] != '"') continue;
+
+        // 往前找 arg0 设置行
+        for (size_t j = i; j > 0; j--) {
+            if (deleted[j - 1]) continue;
+            auto& prev = lines[j - 1];
+            // "arg0 = #ADDR;  // addr" 或 "arg0 = #ADDR;"
+            if (prev.code.find("arg0 = #") == 0 &&
+                (prev.comment.find("addr") != std::string::npos || prev.code.find("// addr") != std::string::npos)) {
+                deleted[j - 1] = true;
+                // 把字符串嵌入函数调用
+                auto paren = lines[i].code.find("();");
+                if (paren != std::string::npos) {
+                    std::string fname = lines[i].code.substr(0, paren);
+                    lines[i].code = fname + "(" + lines[i].comment + ");";
+                    lines[i].comment.clear();
+                }
+                break;
+            }
+            // 跳过其他 arg 设置
+            if (prev.code.find("arg") == 0 && prev.code.find(" = ") != std::string::npos) continue;
+            break; // 不是参数设置, 停止回溯
+        }
+    }
+
+    // ── Pass 3: switch 检测 ──
+    // 连续 3+ 个 "if (SAME_VAR == N) goto ADDR;" → switch
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (deleted[i]) continue;
+        SwitchCase first;
+        if (!parseSwitchCase(lines[i].code, first)) continue;
+
+        // 往前看: 可能有 "v8 = *(sp + 0x14);" 等 (重新加载同一变量)
+        // 统计连续匹配行
+        size_t count = 1;
+        for (size_t j = i + 1; j < lines.size() && !deleted[j]; j++) {
+            SwitchCase sc;
+            // 跳过中间的 "v8 = *(addr);" 重载行 (switch 编译产物)
+            if (lines[j].code.find(first.var + " = ") == 0 && lines[j].code.find("// sets flags") == std::string::npos) {
+                continue;
+            }
+            if (parseSwitchCase(lines[j].code, sc) && sc.var == first.var) {
+                count++;
+                continue;
+            }
+            break;
+        }
+
+        if (count >= 3) {
+            // 替换第一行为 switch 头
+            lines[i].code = "switch (" + first.var + ") {";
+            lines[i].comment = "case " + first.val + ": goto " + first.target;
+
+            // 后续行替换为 case
+            size_t replaced = 1;
+            for (size_t j = i + 1; j < lines.size() && !deleted[j] && replaced < count; j++) {
+                // 删除重载行
+                if (lines[j].code.find(first.var + " = ") == 0 && lines[j].code.find("// sets flags") == std::string::npos) {
+                    deleted[j] = true;
+                    continue;
+                }
+                SwitchCase sc;
+                if (parseSwitchCase(lines[j].code, sc) && sc.var == first.var) {
+                    lines[j].code = "  case " + sc.val + ": goto " + sc.target + ";";
+                    lines[j].comment.clear();
+                    replaced++;
+                }
+            }
+        }
+    }
+
+    // ── Pass 4: if (ptr != 0) 改为 if (ptr) ──
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (deleted[i]) continue;
+        auto& code = lines[i].code;
+        // "if (VAR == 0) goto" → "if (!VAR) goto"
+        auto pos = code.find(" == 0) goto ");
+        if (pos != std::string::npos && code.find("if (") == 0) {
+            std::string var = code.substr(4, pos - 4);
+            code = "if (!" + var + ") goto " + code.substr(pos + 12);
+        }
+        // "if (VAR != 0) goto" → "if (VAR) goto"  (less common but check)
+        pos = code.find(" != 0) goto ");
+        if (pos != std::string::npos && code.find("if (") == 0) {
+            std::string var = code.substr(4, pos - 4);
+            code = "if (" + var + ") goto " + code.substr(pos + 12);
+        }
+    }
+
+    // ── 输出: 过滤 deleted ──
+    std::vector<DecompileLine> out;
+    out.reserve(lines.size());
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (!deleted[i]) out.push_back(std::move(lines[i]));
+    }
     lines = std::move(out);
 }
 
