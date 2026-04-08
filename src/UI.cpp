@@ -335,10 +335,11 @@ void UI::cmdAttach(const std::string& arg) {
         maps_->refresh();
 
         // 自动检测 Unity il2cpp 版本并设置偏移
+        // 搜索所有 libil2cpp.so 区域 (版本字符串在 r--p 只读段, 不在 r-xp 代码段)
         {
-            auto il2cppMod = maps_->findModule("libil2cpp.so");
-            if (il2cppMod) {
-                il2cpp_->autoDetectVersion(il2cppMod->start, il2cppMod->size());
+            auto il2cppRegions = maps_->findByName("libil2cpp.so");
+            for (const auto& r : il2cppRegions) {
+                if (r.readable() && il2cpp_->autoDetectVersion(r.start, r.size())) break;
             }
         }
 
@@ -733,8 +734,11 @@ void UI::cmdIl2cpp(const std::string& arg) {
             if (!ver.empty())
                 printf("    Unity " G "%s\n" RST, ver.c_str());
             else {
-                // 尝试重新检测
-                il2cpp_->autoDetectVersion(mod->start, mod->size());
+                // 尝试重新检测 (搜索所有区域)
+                auto allRegions = maps_->findByName("libil2cpp.so");
+                for (const auto& r : allRegions) {
+                    if (r.readable() && il2cpp_->autoDetectVersion(r.start, r.size())) break;
+                }
                 auto& ver2 = il2cpp_->detectedVersion();
                 if (!ver2.empty())
                     printf("    Unity " G "%s\n" RST, ver2.c_str());
