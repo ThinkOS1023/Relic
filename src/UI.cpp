@@ -1467,25 +1467,34 @@ void UI::cmdDecompile(const std::string& arg) {
 void UI::cmdCall(const std::string& arg) {
     if (!ensureAttached() || !remote_) return;
 
-    std::istringstream iss(arg);
-    std::string addrStr;
-    iss >> addrStr;
-
-    if (addrStr.empty()) {
+    if (arg.empty()) {
         printf("\n  " R "x" RST " 用法:\n");
-        printf("    " W "call <函数名> [arg0] [arg1] ...\n" RST);
+        printf("    " W "call <函数名|地址> [参数...]\n" RST);
+        puts("");
+        printf(D "  参数类型:\n" RST);
+        printf(D "    数字        " W "42" D " 或 " W "0x2a" D " (十进制/十六进制)\n" RST);
+        printf(D "    字符串      " W "\"hello %%d\"" D " (自动写入目标内存)\n" RST);
+        printf(D "    地址        " W "0x7f001000\n" RST);
+        puts("");
+        printf(D "  示例:\n" RST);
         printf("    " W "call getpid\n" RST);
+        printf("    " W "call printf \"hello world\\n\"\n" RST);
+        printf("    " W "call printf \"HP = %%d\\n\" 1000\n" RST);
         printf("    " W "call takeDamage 0x7832024060 75\n" RST);
-        printf("    " W "call 0x7a03e12340 1000 0\n" RST);
         puts("");
         return;
     }
 
-    // 先查符号表, 查不到再当地址解析
+    // 解析: 函数名/地址 + 参数列表 (支持 "字符串" 参数)
+    // 手动解析而非 istringstream, 因为需要处理引号
+    std::string rest = arg;
+    size_t sp = rest.find(' ');
+    std::string addrStr = (sp != std::string::npos) ? rest.substr(0, sp) : rest;
+    std::string argsPart = (sp != std::string::npos) ? rest.substr(sp + 1) : "";
+
+    // 解析函数地址
     addr_t funcAddr = 0;
     std::string funcName;
-
-    // 先当地址解析, 失败再查符号表
     bool isAddr = (addrStr.size() > 2 && addrStr[0] == '0' && (addrStr[1] == 'x' || addrStr[1] == 'X'));
     if (isAddr) {
         try { funcAddr = untag(std::stoull(addrStr, nullptr, 16)); } catch (...) {
@@ -1503,27 +1512,86 @@ void UI::cmdCall(const std::string& arg) {
         if (funcName.empty()) funcName = addrStr;
     }
 
-    // 解析参数
+    // 解析参数: 支持 "字符串" 和数字
     std::vector<addr_t> args;
-    std::string tok;
-    while (iss >> tok) {
-        try { args.push_back(std::stoull(tok, nullptr, 0)); } catch (...) {
-            printf("\n  " R "x" RST " 参数格式错误: %s\n\n", tok.c_str()); return;
+    std::vector<addr_t> strAddrs; // 分配的字符串地址, 调用后释放
+    std::vector<std::string> argDisplay; // 用于打印
+
+    size_t pos = 0;
+    while (pos < argsPart.size()) {
+        // 跳过空格
+        while (pos < argsPart.size() && argsPart[pos] == ' ') pos++;
+        if (pos >= argsPart.size()) break;
+
+        if (argsPart[pos] == '"') {
+            // 字符串参数: 提取到闭合引号
+            pos++; // skip opening "
+            std::string str;
+            while (pos < argsPart.size() && argsPart[pos] != '"') {
+                if (argsPart[pos] == '\\' && pos + 1 < argsPart.size()) {
+                    pos++;
+                    switch (argsPart[pos]) {
+                        case 'n': str += '\n'; break;
+                        case 't': str += '\t'; break;
+                        case '\\': str += '\\'; break;
+                        case '"': str += '"'; break;
+                        case '0': str += '\0'; break;
+                        default: str += '\\'; str += argsPart[pos]; break;
+                    }
+                } else {
+                    str += argsPart[pos];
+                }
+                pos++;
+            }
+            if (pos < argsPart.size()) pos++; // skip closing "
+
+            // 写字符串到目标进程
+            addr_t strAddr = remote_->writeString(str);
+            if (!strAddr) {
+                printf("\n  " R "x" RST " 字符串写入失败\n\n");
+                for (auto sa : strAddrs) remote_->remoteFree(sa, 0x1000);
+                return;
+            }
+            args.push_back(strAddr);
+            strAddrs.push_back(strAddr);
+            argDisplay.push_back("\"" + str + "\"");
+        } else {
+            // 数字参数
+            std::string tok;
+            while (pos < argsPart.size() && argsPart[pos] != ' ') {
+                tok += argsPart[pos++];
+            }
+            try {
+                args.push_back(std::stoull(tok, nullptr, 0));
+                argDisplay.push_back(tok);
+            } catch (...) {
+                printf("\n  " R "x" RST " 参数格式错误: %s\n\n", tok.c_str());
+                for (auto sa : strAddrs) remote_->remoteFree(sa, 0x1000);
+                return;
+            }
         }
     }
 
+    // 打印调用信息
     auto fname = syms_.resolve(funcAddr);
+    if (fname.empty()) fname = funcName;
     printf(D "\n  调用 " RST C "0x%lx" RST, (unsigned long)funcAddr);
     if (!fname.empty()) printf(D " (%s)" RST, fname.c_str());
     printf("(");
-    for (size_t i = 0; i < args.size(); i++) {
+    for (size_t i = 0; i < argDisplay.size(); i++) {
         if (i) printf(", ");
-        printf(W "0x%lx" RST, (unsigned long)args[i]);
+        if (argDisplay[i][0] == '"')
+            printf(Y "%s" RST, argDisplay[i].c_str());
+        else
+            printf(W "%s" RST, argDisplay[i].c_str());
     }
     printf(")\n");
     fflush(stdout);
 
     auto result = remote_->call(funcAddr, args);
+
+    // 释放分配的字符串内存
+    for (auto sa : strAddrs) remote_->remoteFree(sa, 0x1000);
 
     if (result.success) {
         printf("  " G "+" RST " 返回: " C "0x%lx" RST " (" W "%ld" RST ")\n\n",

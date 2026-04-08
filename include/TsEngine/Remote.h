@@ -20,6 +20,9 @@ public:
     };
     CallResult call(addr_t funcAddr, const std::vector<addr_t>& args = {});
 
+    // 在目标进程写入字符串, 返回目标地址 (用完需 remoteFree)
+    addr_t writeString(const std::string& str);
+
     // 远程 mmap: 在目标分配 RWX 内存
     addr_t remoteAlloc(size_t size);
     bool remoteFree(addr_t addr, size_t size);

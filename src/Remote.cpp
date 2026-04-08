@@ -124,6 +124,20 @@ Remote::CallResult Remote::call(addr_t funcAddr, const std::vector<addr_t>& args
     return result;
 }
 
+// ── 写字符串到目标进程 ──
+addr_t Remote::writeString(const std::string& str) {
+    size_t allocSize = (str.size() + 1 + 15) & ~15UL; // 16 字节对齐, 含 null
+    if (allocSize > 0xFFFF) return 0;
+    addr_t addr = remoteAlloc(allocSize);
+    if (!addr) return 0;
+    // RWX 内存可以直接 vm_writev
+    if (!mem_.writeRaw(addr, str.c_str(), str.size() + 1)) {
+        remoteFree(addr, allocSize);
+        return 0;
+    }
+    return addr;
+}
+
 // ── 远程 mmap ──
 addr_t Remote::remoteAlloc(size_t size) {
     // size 超过 64KB 时 shellcode 编码不正确, 拒绝分配
