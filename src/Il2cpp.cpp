@@ -1,6 +1,125 @@
 #include "TsEngine/Il2cpp.h"
 
+#include <cstring>
+#include <algorithm>
+
 namespace TsEngine {
+
+// ── 版本偏移预设 ──
+
+Il2cppOffsets il2cppOffsetsForVersion(const std::string& ver) {
+    Il2cppOffsets o;
+
+    // 解析主版本号
+    int major = 0;
+    try { major = std::stoi(ver); } catch (...) {}
+
+    if (major <= 2019) {
+        // Unity 2018-2019 (il2cpp 24)
+        o.klass_name         = 0x10;
+        o.klass_namespace    = 0x18;
+        o.klass_image        = 0x08;
+        o.klass_parent       = 0x58;
+        o.klass_fields       = 0x80;
+        o.klass_methods      = 0x98;
+        o.klass_field_count  = 0x118;
+        o.klass_method_count = 0x11A;
+        o.klass_instance_size = 0x104;
+        o.klass_token        = 0x100;
+        o.method_name        = 0x08;
+        o.method_pointer     = 0x00;
+        o.method_klass       = 0x10;
+        o.method_return_type = 0x18;
+        o.method_param_count = 0x26;
+        o.method_token       = 0x2C;
+    }
+    else if (major == 2020) {
+        // Unity 2020 (il2cpp 24.4-27)
+        o.klass_name         = 0x10;
+        o.klass_namespace    = 0x18;
+        o.klass_image        = 0x08;
+        o.klass_parent       = 0x58;
+        o.klass_fields       = 0x80;
+        o.klass_methods      = 0x98;
+        o.klass_field_count  = 0x11C;
+        o.klass_method_count = 0x11E;
+        o.klass_instance_size = 0x108;
+        o.klass_token        = 0x104;
+        o.method_name        = 0x10;
+        o.method_pointer     = 0x00;
+        o.method_klass       = 0x18;
+        o.method_return_type = 0x20;
+        o.method_param_count = 0x2E;
+        o.method_token       = 0x34;
+    }
+    else if (major == 2021 || major == 2022) {
+        // Unity 2021-2022 (il2cpp 27-29) — 当前默认值
+        // o 已经是默认构造, 不用改
+    }
+    else if (major >= 2023) {
+        // Unity 2023+ / Unity 6 (il2cpp 31+)
+        o.klass_name         = 0x10;
+        o.klass_namespace    = 0x18;
+        o.klass_image        = 0x08;
+        o.klass_parent       = 0x58;
+        o.klass_fields       = 0x90;
+        o.klass_methods      = 0xA8;
+        o.klass_field_count  = 0x130;
+        o.klass_method_count = 0x132;
+        o.klass_instance_size = 0x11C;
+        o.klass_token        = 0x118;
+        o.method_name        = 0x10;
+        o.method_pointer     = 0x00;
+        o.method_klass       = 0x18;
+        o.method_return_type = 0x20;
+        o.method_param_count = 0x2E;
+        o.method_token       = 0x34;
+    }
+
+    return o;
+}
+
+// 从 libil2cpp.so 内存中搜索 Unity 版本字符串
+// 格式: "20XX.Y.ZZf1" 在 .rodata 中
+std::string detectUnityVersion(const Memory& mem, addr_t base, size_t size) {
+    constexpr size_t BLOCK = 4096 * 16;
+    std::vector<uint8_t> buf(BLOCK);
+
+    for (size_t off = 0; off < size; off += BLOCK) {
+        size_t chunk = std::min(BLOCK, size - off);
+        if (!mem.readRaw(base + off, buf.data(), chunk)) continue;
+
+        for (size_t i = 0; i + 12 < chunk; i++) {
+            // 搜索 "20" 开头的版本字符串: "2019." / "2020." / "2021." / "2022." / "2023." / "6000."
+            if (buf[i] == '2' && buf[i+1] == '0' && buf[i+2] >= '1' && buf[i+2] <= '2' &&
+                buf[i+3] >= '0' && buf[i+3] <= '9' && buf[i+4] == '.') {
+                // 验证后面是数字.数字
+                size_t j = i + 5;
+                while (j < chunk && (buf[j] >= '0' && buf[j] <= '9')) j++;
+                if (j < chunk && buf[j] == '.') {
+                    j++;
+                    while (j < chunk && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == 'f' || buf[j] == 'a' || buf[j] == 'b' || buf[j] == 'p')) j++;
+                    // 确认字符串终止
+                    if (j < chunk && (buf[j] == '\0' || buf[j] == ' ' || buf[j] == '\n')) {
+                        std::string ver(reinterpret_cast<char*>(&buf[i]), j - i);
+                        // 额外验证: 不是随机数据
+                        if (ver.size() >= 8 && ver.size() <= 30) {
+                            return ver;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return "";
+}
+
+bool Il2cppInspector::autoDetectVersion(addr_t il2cppBase, size_t il2cppSize) {
+    detectedVersion_ = detectUnityVersion(mem_, il2cppBase, il2cppSize);
+    if (detectedVersion_.empty()) return false;
+    offsets_ = il2cppOffsetsForVersion(detectedVersion_);
+    return true;
+}
 
 Il2cppInspector::Il2cppInspector(const Memory& mem, Il2cppOffsets offsets)
     : mem_(mem), offsets_(offsets) {}

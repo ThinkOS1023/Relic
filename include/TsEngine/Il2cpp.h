@@ -8,9 +8,7 @@
 namespace TsEngine {
 
 // Il2cpp 运行时结构体偏移量
-// 默认值适用于 Unity 2021~2022 (il2cpp 27~29)
-// 不同版本偏移不同, 可通过 setOffsets() 覆盖
-// 用 il2cpp 命令测试: 如果类名乱码, 说明偏移不对
+// 不同 Unity 版本偏移不同, 用 il2cpp version 查看/设置
 struct Il2cppOffsets {
     // Il2CppObject
     size_t object_klass  = 0x00;  // Il2CppClass* klass
@@ -46,6 +44,13 @@ struct Il2cppOffsets {
     size_t type_data = 0x00;
     size_t type_bits = 0x08; // 低5位是 type enum
 };
+
+// 获取特定 Unity 版本的偏移预设
+// 支持: "2019", "2020", "2021", "2022", "2023"
+Il2cppOffsets il2cppOffsetsForVersion(const std::string& version);
+
+// 从 libil2cpp.so 内存中检测 Unity 版本字符串
+std::string detectUnityVersion(const Memory& mem, addr_t il2cppBase, size_t il2cppSize);
 
 struct Il2cppFieldInfo {
     std::string name;
@@ -108,11 +113,16 @@ public:
     const Il2cppOffsets& offsets() const { return offsets_; }
     void setOffsets(const Il2cppOffsets& o) { offsets_ = o; }
 
+    // 自动检测版本并设置偏移
+    bool autoDetectVersion(addr_t il2cppBase, size_t il2cppSize);
+    const std::string& detectedVersion() const { return detectedVersion_; }
+
 private:
     std::string readTypeName(addr_t typeAddr);
 
     const Memory& mem_;
     Il2cppOffsets offsets_;
+    std::string detectedVersion_;
 };
 
 } // namespace TsEngine
