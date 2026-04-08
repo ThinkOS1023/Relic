@@ -42,7 +42,11 @@ struct Il2cppOffsets {
 
     // Il2CppType
     size_t type_data = 0x00;
-    size_t type_bits = 0x08; // 低5位是 type enum
+    size_t type_bits = 0x08; // attrs(16bit) + type(8bit) + ... 的打包字段
+    size_t type_enum = 0x0A; // uint8_t, 类型枚举 (在 attrs 之后)
+
+    // Il2CppClass 验证 (用于反向查找)
+    size_t klass_bitfield1 = 0x28; // 包含类标识的位域
 };
 
 // 获取特定 Unity 版本的偏移预设
@@ -119,6 +123,7 @@ public:
 
 private:
     std::string readTypeName(addr_t typeAddr);
+    bool isValidKlass(addr_t klass) const;
 
     const Memory& mem_;
     Il2cppOffsets offsets_;

@@ -161,10 +161,11 @@ std::string Il2cppInspector::typeName(uint8_t typeEnum) {
 std::string Il2cppInspector::readTypeName(addr_t typeAddr) {
     if (typeAddr == 0) return "???";
 
-    auto bits = mem_.read<uint64_t>(typeAddr + offsets_.type_bits);
-    if (!bits) return "???";
+    // type enum 在 Il2CppType 的 offset 0x0A (attrs 之后的第一个字节)
+    auto te = mem_.read<uint8_t>(typeAddr + offsets_.type_enum);
+    if (!te) return "???";
 
-    uint8_t typeEnum = static_cast<uint8_t>(*bits & 0x1F);
+    uint8_t typeEnum = *te;
 
     // 对于 Class/ValueType，data 指向 Il2CppClass*，可以递归读类名
     if (typeEnum == 0x11 || typeEnum == 0x12) {
@@ -316,9 +317,31 @@ std::vector<Il2cppMethodInfo> Il2cppInspector::readMethods(addr_t klassAddr) {
     return result;
 }
 
+// 检查 klass 指针是否指向有效的 Il2CppClass
+// 方法: 检查 klass + 0x28 处的 bitfield1 是否为已知的有效值
+// (参考 GG il2cpp 脚本的验证方式, 比字符串检查快且可靠)
+bool Il2cppInspector::isValidKlass(addr_t klass) const {
+    auto val = mem_.read<uint32_t>(klass + offsets_.klass_bitfield1);
+    if (!val) return false;
+    uint32_t v = *val;
+    // 已知的有效 bitfield1 值 (不同类类型)
+    // 0x120000 = 普通 class, 0x1D0000 = sealed class, 0x150000 = abstract class
+    // 也检查其他常见值
+    if (v == 0x120000 || v == 0x1D0000 || v == 0x150000 ||
+        v == 0x100000 || v == 0x160000 || v == 0x110000 ||
+        v == 0x1C0000 || v == 0x140000 || v == 0x180000) {
+        return true;
+    }
+    // 备用: 检查低16位为0且高位合理 (il2cpp class bitfield pattern)
+    if ((v & 0xFFFF) == 0 && (v >> 16) > 0 && (v >> 16) < 0x40) {
+        return true;
+    }
+    return false;
+}
+
 std::optional<FieldLookupResult> Il2cppInspector::findObjectByFieldAddr(addr_t fieldAddr) {
-    // 从 fieldAddr 向前扫描, 步长 8 字节, 最多 4096 字节
-    for (size_t off = 8; off <= 4096; off += 8) {
+    // 从 fieldAddr 向前扫描, 步长 4 字节 (与 GG 脚本一致), 最多 4096 字节
+    for (size_t off = 4; off <= 4096; off += 4) {
         addr_t candidate = fieldAddr - off;
 
         // 读候选 klass 指针
@@ -326,24 +349,12 @@ std::optional<FieldLookupResult> Il2cppInspector::findObjectByFieldAddr(addr_t f
         if (!klassPtr || *klassPtr == 0) continue;
         addr_t klass = untag(*klassPtr);
 
-        // 验证 klass: 能读到类名字符串?
-        auto namePtr = mem_.read<addr_t>(klass + offsets_.klass_name);
-        if (!namePtr || *namePtr == 0) continue;
-        auto name = mem_.readString(*namePtr, 64);
-        if (!name || name->empty()) continue;
+        // 快速验证: klass + 0x28 bitfield 检查
+        if (!isValidKlass(klass)) continue;
 
-        // 类名应是可打印 ASCII
-        bool valid = true;
-        for (char c : *name) {
-            if (c < 0x20 || c > 0x7e) { valid = false; break; }
-        }
-        if (!valid) continue;
-
-        // 验证 instanceSize
+        // 进一步验证: instanceSize 合理且 fieldAddr 在范围内
         auto instSize = mem_.read<uint32_t>(klass + offsets_.klass_instance_size);
         if (!instSize || *instSize == 0 || *instSize > 0x10000) continue;
-
-        // fieldAddr 必须落在 [candidate, candidate + instanceSize) 内
         if (off > *instSize) continue;
 
         // 有效! 解析完整类信息
