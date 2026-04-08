@@ -2114,10 +2114,12 @@ void UI::pollWatchHits() {
             }
         }
 
-        printf("\r  " Y "[hit]" RST " " C "0x%lx" RST, (unsigned long)pc);
+        // 清行 + 打印命中信息, 不干扰提示符
+        printf("\033[2K\r  " Y "[hit]" RST " " C "0x%lx" RST, (unsigned long)pc);
         if (!asmStr.empty())
             printf("  " G "%s" RST, asmStr.c_str());
-        printf("\n");
+        printf(RST "\n");
+        fflush(stdout);
 
         record("0x%lx  %s\n", (unsigned long)pc, asmStr.c_str());
 
