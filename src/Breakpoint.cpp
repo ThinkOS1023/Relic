@@ -419,11 +419,9 @@ bool Breakpoint::watchRemove(addr_t addr) {
         if (wps_.empty()) clearHwWatchpoints();
         else applyWatchpoints();
 
-        // 没有断点/观察点了 → 恢复运行
-        if (bps_.empty() && wps_.empty()) {
-            ptrace(PTRACE_CONT, pid_, nullptr, nullptr);
+        // 无论是否还有观察点/断点, 都恢复进程运行
+        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) >= 0)
             running_ = true;
-        }
     }
     return true;
 }
