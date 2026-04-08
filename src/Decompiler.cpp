@@ -61,6 +61,152 @@ static std::string memExpr(const std::string& mem) {
     return "*(" + bn + " + " + off + ")";
 }
 
+// ── 条件码 → 运算符 ──
+
+static std::string condToOp(const std::string& cond) {
+    if (cond == "eq") return "==";
+    if (cond == "ne") return "!=";
+    if (cond == "le") return "<=";
+    if (cond == "lt") return "<";
+    if (cond == "ge") return ">=";
+    if (cond == "gt") return ">";
+    if (cond == "hi") return "> (u)";
+    if (cond == "ls") return "<= (u)";
+    if (cond == "hs" || cond == "cs") return ">= (u)";
+    if (cond == "lo" || cond == "cc") return "< (u)";
+    return cond;
+}
+
+// 从 goto 行提取目标地址
+static addr_t parseGotoAddr(const std::string& code) {
+    // "goto #0x1234;" 或 "if (...) goto #0x1234;"
+    auto pos = code.find("goto ");
+    if (pos == std::string::npos) return 0;
+    pos += 5; // skip "goto "
+    if (pos < code.size() && code[pos] == '*') return 0; // indirect
+    std::string addrStr = code.substr(pos);
+    if (!addrStr.empty() && addrStr.back() == ';') addrStr.pop_back();
+    if (addrStr.empty()) return 0;
+    if (addrStr[0] == '#') addrStr = addrStr.substr(1);
+    try { return std::stoull(addrStr, nullptr, 16); } catch (...) { return 0; }
+}
+
+// 从 "subs" 行提取变量名和立即数: "VN = VN - IMM;  // sets flags"
+struct SubsInfo { std::string var; std::string imm; };
+static bool parseSubsLine(const std::string& code, SubsInfo& out) {
+    auto sf = code.find("// sets flags");
+    if (sf == std::string::npos) return false;
+
+    // "if (X - Y)" 形式 (dst=wzr/xzr 时)
+    if (code.find("if (") == 0) {
+        auto dash = code.find(" - ");
+        if (dash == std::string::npos) return false;
+        out.var = code.substr(4, dash - 4);
+        auto close = code.find(')', dash);
+        if (close == std::string::npos) return false;
+        out.imm = code.substr(dash + 3, close - dash - 3);
+        return true;
+    }
+
+    // "VN = VN - IMM;  // sets flags" 形式
+    auto eq = code.find(" = ");
+    auto dash = code.find(" - ");
+    if (eq == std::string::npos || dash == std::string::npos) return false;
+    out.var = code.substr(0, eq);
+    auto semi = code.find(';', dash);
+    if (semi == std::string::npos) return false;
+    out.imm = code.substr(dash + 3, semi - dash - 3);
+    return true;
+}
+
+// 从 "if (X cmp Y)" 行提取操作数
+struct CmpInfo { std::string lhs; std::string rhs; };
+static bool parseCmpLine(const std::string& code, CmpInfo& out) {
+    if (code.find("if (") != 0) return false;
+    auto cmpPos = code.find(" cmp ");
+    if (cmpPos == std::string::npos) return false;
+    out.lhs = code.substr(4, cmpPos - 4);
+    auto close = code.find(')', cmpPos);
+    if (close == std::string::npos) return false;
+    out.rhs = code.substr(cmpPos + 5, close - cmpPos - 5);
+    return true;
+}
+
+// 从 "if (COND) goto ADDR;" 行提取条件码和目标
+struct CondBrInfo { std::string cond; std::string target; };
+static bool parseCondBranch(const std::string& code, CondBrInfo& out) {
+    if (code.find("if (") != 0) return false;
+    auto close = code.find(") goto ");
+    if (close == std::string::npos) return false;
+    out.cond = code.substr(4, close - 4);
+    auto semi = code.find(';', close);
+    if (semi == std::string::npos) return false;
+    out.target = code.substr(close + 7, semi - close - 7);
+    return true;
+}
+
+// ── Peephole 优化 ──
+
+static void optimizeLines(std::vector<DecompileLine>& lines) {
+    std::vector<DecompileLine> out;
+    out.reserve(lines.size());
+
+    for (size_t i = 0; i < lines.size(); i++) {
+        auto& cur = lines[i];
+        bool hasNext = (i + 1 < lines.size());
+
+        // ─ Pattern 1: 去除 fallthrough goto ─
+        // "goto #ADDR;" 且下一行地址就是 ADDR → 跳过
+        if (hasNext && cur.code.find("goto ") == 0 && cur.code.find("goto *") != 0) {
+            addr_t target = parseGotoAddr(cur.code);
+            if (target != 0 && target == lines[i + 1].address) {
+                continue; // 删掉这行
+            }
+        }
+
+        // ─ Pattern 2: subs + 条件分支 → if (var OP imm) goto ─
+        // "v8 = v8 - N;  // sets flags" + "if (eq) goto ADDR;" → "if (v8 == N) goto ADDR;"
+        if (hasNext) {
+            SubsInfo si;
+            CondBrInfo bi;
+            if (parseSubsLine(cur.code, si) && parseCondBranch(lines[i + 1].code, bi)) {
+                std::string op = condToOp(bi.cond);
+                std::string merged = "if (" + si.var + " " + op + " " + si.imm + ") goto " + bi.target + ";";
+                // 保留第二行 (条件分支), 替换内容, 删第一行
+                lines[i + 1].code = merged;
+                if (cur.isTarget) lines[i + 1].isTarget = true;
+                continue; // 跳过 subs 行
+            }
+        }
+
+        // ─ Pattern 3: cmp + 条件分支 → if (X OP Y) goto ─
+        // "if (X cmp Y)" + "if (eq) goto ADDR;" → "if (X == Y) goto ADDR;"
+        if (hasNext) {
+            CmpInfo ci;
+            CondBrInfo bi;
+            if (parseCmpLine(cur.code, ci) && parseCondBranch(lines[i + 1].code, bi)) {
+                std::string op = condToOp(bi.cond);
+                std::string merged = "if (" + ci.lhs + " " + op + " " + ci.rhs + ") goto " + bi.target + ";";
+                lines[i + 1].code = merged;
+                if (cur.isTarget) lines[i + 1].isTarget = true;
+                continue;
+            }
+        }
+
+        // ─ Pattern 4: 标注后向跳转为 loop ─
+        if (cur.code.find("goto ") == 0 && cur.code.find("goto *") != 0) {
+            addr_t target = parseGotoAddr(cur.code);
+            if (target != 0 && target < cur.address) {
+                cur.comment = "loop";
+            }
+        }
+
+        out.push_back(std::move(cur));
+    }
+
+    lines = std::move(out);
+}
+
 // ── 反编译主逻辑 ──
 
 DecompileResult decompile(
@@ -340,6 +486,10 @@ DecompileResult decompile(
 
     cs_free(insn, n);
     cs_close(&cs);
+
+    // ── Peephole 优化 ──
+    optimizeLines(result.lines);
+
     return result;
 }
 
