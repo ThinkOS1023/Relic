@@ -187,7 +187,9 @@ bool Symbols::load(const std::string& elfPath, addr_t baseAddr) {
         }
     }
 
-    // 构建排序数组用于范围查找
+    // 构建排序数组用于范围查找 (每次 load 后重建, 避免重复累加)
+    sortedSyms_.clear();
+    sortedSyms_.reserve(symbols_.size());
     for (const auto& [_, sym] : symbols_) {
         sortedSyms_.push_back(sym);
     }

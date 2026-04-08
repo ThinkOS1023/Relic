@@ -141,33 +141,34 @@ bool Breakpoint::disable(addr_t addr) {
 // ── 命中等待 ──
 
 std::optional<addr_t> Breakpoint::waitHit() {
-    if (!running_) {
-        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) < 0) return std::nullopt;
+    while (true) {
+        if (!running_) {
+            if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) < 0) return std::nullopt;
+        }
+
+        int status;
+        if (waitpid(pid_, &status, 0) < 0) return std::nullopt;
+        running_ = false;
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) return std::nullopt;
+        if (!WIFSTOPPED(status)) return std::nullopt;
+
+        int sig = WSTOPSIG(status);
+        if (sig != SIGTRAP) {
+            ptrace(PTRACE_CONT, pid_, nullptr, reinterpret_cast<void*>(sig));
+            running_ = true;
+            continue;
+        }
+
+        auto regs = getRegs();
+        if (!regs) return std::nullopt;
+
+        addr_t hitAddr = regs->pc;
+        auto bpIt = bps_.find(hitAddr);
+        if (bpIt != bps_.end()) bpIt->second.hitCount++;
+
+        return hitAddr;
     }
-
-    int status;
-    if (waitpid(pid_, &status, 0) < 0) return std::nullopt;
-    running_ = false;
-
-    if (WIFEXITED(status) || WIFSIGNALED(status)) return std::nullopt;
-    if (!WIFSTOPPED(status)) return std::nullopt;
-
-    int sig = WSTOPSIG(status);
-    if (sig != SIGTRAP) {
-        ptrace(PTRACE_CONT, pid_, nullptr, reinterpret_cast<void*>(sig));
-        running_ = true;
-        return waitHit();
-    }
-
-    auto regs = getRegs();
-    if (!regs) return std::nullopt;
-
-    addr_t hitAddr = regs->pc;
-    auto bpIt = bps_.find(hitAddr);
-    if (bpIt != bps_.end()) bpIt->second.hitCount++;
-    for (auto& [_, wp] : wps_) wp.hitCount++;
-
-    return hitAddr;
 }
 
 std::optional<addr_t> Breakpoint::pollHit() {
@@ -196,7 +197,6 @@ std::optional<addr_t> Breakpoint::pollHit() {
     addr_t hitAddr = regs->pc;
     auto bpIt = bps_.find(hitAddr);
     if (bpIt != bps_.end()) bpIt->second.hitCount++;
-    for (auto& [_, wp] : wps_) wp.hitCount++;
 
     return hitAddr;
 }
@@ -257,11 +257,7 @@ void Breakpoint::resumeProcess() {
 
 bool Breakpoint::singleStep() {
     if (ptrace(PTRACE_SINGLESTEP, pid_, nullptr, nullptr) < 0) {
-        auto r = getRegs();
-        if (!r) return false;
-        RegState s = *r;
-        s.pc += 4;
-        return setRegs(s);
+        return false;
     }
     int status;
     if (waitpid(pid_, &status, 0) < 0) return false;
@@ -361,7 +357,9 @@ bool Breakpoint::applyWatchpoints() {
         }
 
         int byteOff = wp.address & 7;
-        uint8_t bas = ((1 << wp.size) - 1) << byteOff;
+        // 如果观察范围超出 8 字节对齐边界, 强制对齐
+        if (byteOff + (int)wp.size > 8) byteOff = 0;
+        uint8_t bas = static_cast<uint8_t>(((1u << wp.size) - 1) << byteOff);
         ctrl |= (static_cast<uint32_t>(bas) << 5);
 
         state.dbg_regs[wp.slot].addr = wp.address & ~7UL;
@@ -387,8 +385,8 @@ bool Breakpoint::watchAdd(addr_t addr, size_t size, WatchpointInfo::Mode mode) {
     int slot = findFreeWatchSlot();
     if (slot < 0) {
         // 没空闲槽位, 恢复运行
-        ptrace(PTRACE_CONT, pid_, nullptr, nullptr);
-        running_ = true;
+        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) >= 0)
+            running_ = true;
         return false;
     }
 
@@ -399,13 +397,13 @@ bool Breakpoint::watchAdd(addr_t addr, size_t size, WatchpointInfo::Mode mode) {
 
     if (!applyWatchpoints()) {
         wps_.erase(addr);
-        ptrace(PTRACE_CONT, pid_, nullptr, nullptr);
-        running_ = true;
+        if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) >= 0)
+            running_ = true;
         return false;
     }
 
-    running_ = true;
-    ptrace(PTRACE_CONT, pid_, nullptr, nullptr);
+    if (ptrace(PTRACE_CONT, pid_, nullptr, nullptr) >= 0)
+        running_ = true;
     return true;
 }
 

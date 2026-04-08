@@ -10,8 +10,11 @@ file(GLOB_RECURSE SOURCES src/*.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
+find_path(CAPSTONE_INCLUDE capstone/capstone.h)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+    ${CAPSTONE_INCLUDE}
 )
 
 target_compile_options(${PROJECT_NAME} PRIVATE
@@ -19,7 +22,12 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -ffunction-sections -fdata-sections
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE capstone)
+find_library(CAPSTONE_LIB capstone)
+if(CAPSTONE_LIB)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CAPSTONE_LIB})
+else()
+    target_link_libraries(${PROJECT_NAME} PRIVATE capstone)
+endif()
 
 target_link_options(${PROJECT_NAME} PRIVATE
     -Wl,--gc-sections

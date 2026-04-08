@@ -1,4 +1,6 @@
 #include "TsEngine/UI.h"
+#include "TsEngine/Analysis.h"
+#include "TsEngine/Decompiler.h"
 
 #include <cstdio>
 #include <cstdarg>
@@ -57,7 +59,7 @@ void UI::record(const char* fmt, ...) {
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (n > 0) {
-        lastOutput_.append(buf, n);
+        lastOutput_.append(buf, std::min(n, (int)sizeof(buf) - 1));
     }
 }
 
@@ -275,12 +277,14 @@ void UI::printHelp() {
     puts("");
 }
 
-void UI::ensureAttached() {
+bool UI::ensureAttached() {
     if (!proc_.isAttached()) {
         printf("\n  " R "✗" RST " 未附加进程\n");
         printf(D "    先执行: " W "attach <包名>" D " 或 " W "attach <pid>\n" RST);
         puts("");
+        return false;
     }
+    return true;
 }
 
 // ===== 命令实现 =====
@@ -297,7 +301,13 @@ void UI::cmdAttach(const std::string& arg) {
     bool isPid = std::all_of(arg.begin(), arg.end(), ::isdigit);
 
     if (isPid) {
-        pid = std::stoi(arg);
+        try {
+            pid = std::stoi(arg);
+        } catch (...) {
+            printf("\n  " R "✗" RST " PID 超出范围: " W "%s\n" RST, arg.c_str());
+            puts("");
+            return;
+        }
     } else {
         auto found = Process::findPid(arg);
         if (!found) {
@@ -363,8 +373,7 @@ void UI::cmdDetach() {
 }
 
 void UI::cmdPause() {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
     if (proc_.pause())
         printf("\n  " G "✓" RST " 已暂停 PID:%d\n\n", proc_.pid());
     else
@@ -372,8 +381,7 @@ void UI::cmdPause() {
 }
 
 void UI::cmdResume() {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
     if (proc_.resume())
         printf("\n  " G "✓" RST " 已恢复 PID:%d\n\n", proc_.pid());
     else
@@ -405,8 +413,7 @@ void UI::cmdPs(const std::string& filter) {
 }
 
 void UI::cmdMaps(const std::string& filter) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     maps_->refresh();
     auto regions = filter.empty() ? maps_->regions() : maps_->findByName(filter);
@@ -436,8 +443,7 @@ void UI::cmdMaps(const std::string& filter) {
 }
 
 void UI::cmdRead(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr;
@@ -465,8 +471,7 @@ void UI::cmdRead(const std::string& arg) {
 }
 
 void UI::cmdWrite(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr, hexPart;
@@ -507,8 +512,7 @@ void UI::cmdWrite(const std::string& arg) {
 }
 
 void UI::cmdBp(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string sub;
@@ -633,8 +637,7 @@ void UI::cmdBp(const std::string& arg) {
 }
 
 void UI::cmdRegs() {
-    ensureAttached();
-    if (!proc_.isAttached() || !bp_) return;
+    if (!ensureAttached() || !bp_) return;
 
     auto regs = bp_->getRegs();
     if (!regs) {
@@ -699,8 +702,7 @@ void UI::cmdRegs() {
 }
 
 void UI::cmdIl2cpp(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     if (arg == "find") {
         maps_->refresh();
@@ -784,8 +786,7 @@ void UI::cmdIl2cpp(const std::string& arg) {
 }
 
 void UI::cmdWatch(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string sub;
@@ -889,8 +890,7 @@ void UI::cmdWatch(const std::string& arg) {
 }
 
 void UI::cmdDisasm(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr, countStr;
@@ -911,41 +911,17 @@ void UI::cmdDisasm(const std::string& arg) {
         printf("\n  " R "x" RST " 地址格式错误\n\n"); return;
     }
 
-    // func 模式: 往前找函数头, 往后找 ret
+    // func 模式: 自动检测函数边界
     if (countStr == "func" || countStr == "fn" || countStr == "f") {
-        // 往前搜函数头: stp x29, x30 (0xa9xx7bfd) 最多 512 条
-        addr_t funcStart = addr;
-        for (int i = 1; i <= 512; i++) {
-            addr_t probe = addr - i * 4;
-            auto inst = mem_->read<uint32_t>(probe);
-            if (!inst) break;
-            // stp x29, x30, [sp, #imm]! → 编码: 0xa9xx7bfd
-            if ((*inst & 0xFFE07FFF) == 0xA9007BFD ||  // stp x29,x30,[sp,#imm]!
-                (*inst & 0xFFE07FFF) == 0xA9807BFD) {   // stp x29,x30,[sp,#imm]! (pre-index)
-                funcStart = probe;
-                break;
-            }
-            // 也检查上一个 ret (说明新函数开始于 ret 之后)
-            if (*inst == 0xD65F03C0) { // ret
-                funcStart = probe + 4;
-                break;
-            }
+        auto bounds = findFunctionBounds(*mem_, addr);
+        if (!bounds) {
+            printf("\n  " R "x" RST " 函数范围异常\n\n");
+            return;
         }
+        addr_t funcStart = bounds->start;
+        addr_t funcEnd = bounds->end;
 
-        // 往后搜 ret, 最多 1024 条
-        addr_t funcEnd = addr;
-        for (int i = 0; i <= 1024; i++) {
-            addr_t probe = addr + i * 4;
-            auto inst = mem_->read<uint32_t>(probe);
-            if (!inst) break;
-            if (*inst == 0xD65F03C0) { // ret
-                funcEnd = probe + 4; // 包含 ret 本身
-                break;
-            }
-        }
-
-        int total = static_cast<int>((funcEnd - funcStart) / 4);
-        if (total < 1) total = 16;
+        int total = static_cast<int>(bounds->size() / 4);
         if (total > 1024) total = 1024;
 
         size_t dataSize = total * 4;
@@ -1127,8 +1103,7 @@ void UI::cmdDisasm(const std::string& arg) {
 }
 
 void UI::cmdPatch(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr, what;
@@ -1267,7 +1242,6 @@ void UI::cmdPatch(const std::string& arg) {
     if (!ok) {
         // 代码段写不了, 用 ptrace POKETEXT
         ok = true;
-        bool wasRunning = bp_->isRunning();
         bool wasAttached = bp_->isAttached();
 
         // ptrace attach (如果还没有)
@@ -1276,12 +1250,8 @@ void UI::cmdPatch(const std::string& arg) {
             return;
         }
 
-        // 进程在跑 → 先停下来
-        if (wasRunning || (wasAttached && bp_->isRunning())) {
-            kill(proc_.pid(), SIGSTOP);
-            int st;
-            waitpid(proc_.pid(), &st, 0);
-        }
+        // 通过 Breakpoint 管理停止/恢复
+        bp_->stopProcess();
 
         for (size_t i = 0; i < instructions.size(); i++) {
             addr_t target = addr + i * 4;
@@ -1304,7 +1274,10 @@ void UI::cmdPatch(const std::string& arg) {
         }
 
         // 恢复运行
-        ptrace(PTRACE_CONT, proc_.pid(), nullptr, nullptr);
+        bp_->resumeProcess();
+
+        // 如果之前未 attach, 恢复原状
+        if (!wasAttached) bp_->ptraceDetach();
     }
 
     if (!ok) {
@@ -1336,8 +1309,7 @@ void UI::cmdPatch(const std::string& arg) {
 }
 
 void UI::cmdDumpFn(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr, filename;
@@ -1354,33 +1326,14 @@ void UI::cmdDumpFn(const std::string& arg) {
         printf("\n  " R "x" RST " 地址格式错误\n\n"); return;
     }
 
-    // 找函数头
-    addr_t funcStart = addr;
-    for (int i = 1; i <= 512; i++) {
-        addr_t probe = addr - i * 4;
-        auto inst = mem_->read<uint32_t>(probe);
-        if (!inst) break;
-        if ((*inst & 0xFFC07FFF) == 0xA9007BFD || (*inst & 0xFFC07FFF) == 0xA9807BFD) {
-            funcStart = probe; break;
-        }
-        if (*inst == 0xD65F03C0) { funcStart = probe + 4; break; }
-    }
-
-    // 找函数尾
-    addr_t funcEnd = addr;
-    for (int i = 0; i <= 1024; i++) {
-        addr_t probe = addr + i * 4;
-        auto inst = mem_->read<uint32_t>(probe);
-        if (!inst) break;
-        if (*inst == 0xD65F03C0) { funcEnd = probe + 4; break; }
-    }
-
-    size_t funcSize = funcEnd - funcStart;
-    if (funcSize < 4 || funcSize > 1024 * 1024) {
-        printf("\n  " R "x" RST " 函数范围异常: 0x%lx ~ 0x%lx (%zu bytes)\n\n",
-               (unsigned long)funcStart, (unsigned long)funcEnd, funcSize);
+    auto bounds = findFunctionBounds(*mem_, addr);
+    if (!bounds) {
+        printf("\n  " R "x" RST " 函数范围异常\n\n");
         return;
     }
+    addr_t funcStart = bounds->start;
+    addr_t funcEnd = bounds->end;
+    size_t funcSize = bounds->size();
 
     auto data = mem_->readBuffer(funcStart, funcSize);
     if (!data) {
@@ -1440,71 +1393,11 @@ void UI::cmdDumpFn(const std::string& arg) {
     printf(D "    Base Address: 0x%lx\n" RST "\n", (unsigned long)funcStart);
 }
 
-// ── 伪 C 反编译器 ──
-
-// 拆分操作数
-static std::vector<std::string> splitOps(const char* ops) {
-    std::vector<std::string> r;
-    std::string s = ops;
-    size_t p = 0;
-    int bracket = 0;
-    size_t start = 0;
-    for (p = 0; p <= s.size(); p++) {
-        if (p < s.size() && s[p] == '[') bracket++;
-        if (p < s.size() && s[p] == ']') bracket--;
-        if ((p == s.size() || (s[p] == ',' && bracket == 0))) {
-            auto b = s.find_first_not_of(" ", start);
-            auto e = s.find_last_not_of(" ", p > 0 ? p - 1 : 0);
-            if (b != std::string::npos && b <= e)
-                r.push_back(s.substr(b, e - b + 1));
-            start = p + 1;
-        }
-    }
-    return r;
-}
-
-// 寄存器 → 变量名
-static std::string regName(const std::string& r) {
-    if (r == "wzr" || r == "xzr") return "0";
-    if (r == "sp") return "sp";
-    // w0-w7 / x0-x7 → arg0-arg7
-    if ((r[0] == 'w' || r[0] == 'x') && r.size() <= 3) {
-        int n = std::atoi(r.c_str() + 1);
-        if (n <= 7) return "arg" + std::to_string(n);
-        return "v" + std::to_string(n); // x8+ → v8, v9...
-    }
-    return r;
-}
-
-// 内存操作数 → C 表达式: [x9] → *arg1, [sp, #8] → *(sp+8), [x8, #0x10] → *(v8+0x10)
-static std::string memExpr(const std::string& mem) {
-    // 去掉 [ ]
-    auto b = mem.find('[');
-    auto e = mem.find(']');
-    if (b == std::string::npos) return mem;
-    std::string inner = mem.substr(b + 1, e - b - 1);
-
-    auto comma = inner.find(',');
-    if (comma == std::string::npos) {
-        return "*" + regName(inner);
-    }
-    std::string base = inner.substr(0, comma);
-    std::string off = inner.substr(comma + 1);
-    // trim
-    while (!base.empty() && base.back() == ' ') base.pop_back();
-    while (!off.empty() && off.front() == ' ') off = off.substr(1);
-    // #0x10 → 0x10
-    if (off[0] == '#') off = off.substr(1);
-
-    std::string bn = regName(base);
-    if (off == "0" || off == "0x0") return "*" + bn;
-    return "*(" + bn + " + " + off + ")";
-}
+// ── 伪 C 反编译器 (已提取到 Decompiler.h/cpp) ──
 
 
 void UI::cmdDecompile(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     if (arg.empty()) {
         printf("\n  " R "x" RST " 用法: " W "dec <函数内地址>\n" RST "\n");
@@ -1517,377 +1410,62 @@ void UI::cmdDecompile(const std::string& arg) {
     }
 
     // 找函数头尾
-    addr_t funcStart = addr;
-    for (int i = 1; i <= 512; i++) {
-        addr_t probe = addr - i * 4;
-        auto inst = mem_->read<uint32_t>(probe);
-        if (!inst) break;
-        if ((*inst & 0xFFC07FFF) == 0xA9007BFD || (*inst & 0xFFC07FFF) == 0xA9807BFD) {
-            funcStart = probe; break;
-        }
-        if (*inst == 0xD65F03C0) { funcStart = probe + 4; break; }
-    }
-
-    addr_t funcEnd = addr;
-    for (int i = 0; i <= 1024; i++) {
-        addr_t probe = addr + i * 4;
-        auto inst = mem_->read<uint32_t>(probe);
-        if (!inst) break;
-        if (*inst == 0xD65F03C0) { funcEnd = probe + 4; break; }
-    }
-
-    size_t funcSize = funcEnd - funcStart;
-    if (funcSize < 4 || funcSize > 1024 * 1024) {
+    auto bounds = findFunctionBounds(*mem_, addr);
+    if (!bounds) {
         printf("\n  " R "x" RST " 函数范围异常\n\n"); return;
     }
+    addr_t funcStart = bounds->start;
+    addr_t funcEnd = bounds->end;
+    size_t funcSize = bounds->size();
 
     auto data = mem_->readBuffer(funcStart, funcSize);
     if (!data) { printf("\n  " R "x" RST " 读取失败\n\n"); return; }
 
-    csh cs;
-    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &cs) != CS_ERR_OK) {
-        printf("\n  " R "x" RST " capstone 失败\n\n"); return;
+    auto result = decompile(*mem_, syms_, funcStart, funcEnd, addr, data->data(), data->size());
+    if (result.lines.empty()) {
+        printf("\n  " R "x" RST " 反编译失败\n\n"); return;
     }
-    cs_option(cs, CS_OPT_DETAIL, CS_OPT_ON);
-
-    cs_insn* insn;
-    size_t n = cs_disasm(cs, data->data(), data->size(), funcStart, 0, &insn);
-    if (n == 0) { cs_close(&cs); printf("\n  " R "x" RST " 反汇编失败\n\n"); return; }
 
     lastOutput_.clear();
-
-    // 分析: 哪些 arg 寄存器被用到
-    bool usesArg[8] = {};
-    int stackFrame = 0;
-    for (size_t i = 0; i < n; i++) {
-        std::string ops = insn[i].op_str;
-        for (int a = 0; a < 8; a++) {
-            char wr[4], xr[4];
-            snprintf(wr, 4, "w%d", a);
-            snprintf(xr, 4, "x%d", a);
-            if (ops.find(wr) != std::string::npos || ops.find(xr) != std::string::npos)
-                usesArg[a] = true;
-        }
-        // 检测 sp -= N (栈帧大小)
-        std::string mn = insn[i].mnemonic;
-        if (mn == "sub" && ops.find("sp, sp") != std::string::npos) {
-            auto h = ops.find("#0x");
-            if (h != std::string::npos) {
-                try { stackFrame = std::stoi(ops.substr(h + 1), nullptr, 16); } catch (...) {}
-            }
-        }
-    }
 
     // 打印函数签名
     puts("");
     printf(BLD M "  伪 C" RST D " @ 0x%lx (%zu inst, stack: 0x%x)\n" RST,
-           (unsigned long)funcStart, n, stackFrame);
+           (unsigned long)funcStart, result.lines.size(), result.stackFrame);
     line(D, 60);
 
-    // 签名: int64_t func(int64_t arg0, int64_t arg1, ...)
     printf("  " D "// 0x%lx - 0x%lx\n" RST, (unsigned long)funcStart, (unsigned long)funcEnd);
-    std::string funcName = syms_.resolve(funcStart);
-    if (funcName.empty()) {
-        char buf[32]; snprintf(buf, sizeof(buf), "sub_%lx", (unsigned long)funcStart);
-        funcName = buf;
-    }
-    printf("  " C "int64_t " RST BLD W "%s" RST C "(" RST, funcName.c_str());
-    record("// 0x%lx - 0x%lx\nint64_t %s(", (unsigned long)funcStart, (unsigned long)funcEnd, funcName.c_str());
-    bool first = true;
-    for (int a = 0; a < 8; a++) {
-        if (!usesArg[a]) continue;
-        if (!first) { printf(", "); record(", "); }
-        printf(C "int64_t " RST W "arg%d" RST, a);
-        record("int64_t arg%d", a);
-        first = true; first = false;
-    }
-    if (first) { printf(C "void" RST); record("void"); }
-    printf(C ") {" RST "\n");
-    record(") {\n");
+    printf("  " C "%s" RST C " {" RST "\n", result.signature.c_str());
+    record("// 0x%lx - 0x%lx\n%s {\n", (unsigned long)funcStart, (unsigned long)funcEnd, result.signature.c_str());
 
-    // 寄存器值跟踪 (用于解析 adrp+add 组合拿到字符串地址)
-    std::unordered_map<std::string, addr_t> regTrack; // "x0" → 已知值
-
-    // 翻译每条指令
-    for (size_t i = 0; i < n; i++) {
-        std::string mn = insn[i].mnemonic;
-        std::string ops = insn[i].op_str;
-        auto parts = splitOps(insn[i].op_str);
-        bool isTarget = (insn[i].address == addr);
-
-        std::string line;
-        std::string comment; // 额外注释 (字符串内容等)
-
-        // 跟踪 adrp: reg = page_addr
-        if (mn == "adrp" && parts.size() == 2) {
-            addr_t val = 0;
-            try { val = untag(std::stoull(parts[1].substr(parts[1][0] == '#' ? 1 : 0), nullptr, 16)); } catch (...) {}
-            if (val) regTrack[parts[0]] = val;
-        }
-        // 跟踪 adr: reg = addr
-        if (mn == "adr" && parts.size() == 2) {
-            addr_t val = 0;
-            try { val = untag(std::stoull(parts[1].substr(parts[1][0] == '#' ? 1 : 0), nullptr, 16)); } catch (...) {}
-            if (val) regTrack[parts[0]] = val;
-        }
-        // 跟踪 add reg, reg, #imm (adrp+add 组合)
-        if (mn == "add" && parts.size() == 3 && parts[0] == parts[1]) {
-            auto it = regTrack.find(parts[0]);
-            if (it != regTrack.end()) {
-                std::string imm = parts[2];
-                if (!imm.empty() && imm[0] == '#') imm = imm.substr(1);
-                try {
-                    addr_t off = std::stoull(imm, nullptr, 16);
-                    it->second += off;
-                } catch (...) {}
-            }
-        }
-        // 跟踪 mov reg, #imm
-        if ((mn == "mov" || mn == "movz") && parts.size() == 2) {
-            std::string imm = parts[1];
-            if (!imm.empty() && imm[0] == '#') {
-                try {
-                    addr_t val = std::stoull(imm.substr(1), nullptr, 0);
-                    regTrack[parts[0]] = val;
-                } catch (...) {}
-            }
-        }
-
-        // bl 调用前检查 x0 (第一个参数), 如果是已知地址尝试读字符串
-        if (mn == "bl") {
-            auto it = regTrack.find("x0");
-            if (it != regTrack.end() && it->second > 0x1000) {
-                auto s = mem_->readString(it->second, 80);
-                if (s && !s->empty() && s->size() > 1) {
-                    // 截断太长的
-                    std::string str = *s;
-                    if (str.size() > 50) str = str.substr(0, 50) + "...";
-                    // 转义换行
-                    for (auto& c : str) { if (c == '\n') c = ' '; if (c == '\r') c = ' '; }
-                    comment = "\"" + str + "\"";
-                }
-            }
-            // bl 后 x0 被修改 (返回值)
-            regTrack.erase("x0");
-        }
-
-        // 任何修改寄存器的指令清掉旧跟踪 (简化: bl/blr 清 x0-x7)
-        if (mn == "bl" || mn == "blr") {
-            for (int a = 0; a <= 18; a++) {
-                char r[4]; snprintf(r, 4, "x%d", a);
-                regTrack.erase(r);
-            }
-        }
-
-        // 跳过 nop
-        if (mn == "nop") continue;
-
-        // 序言/尾声
-        if (mn == "stp" && ops.find("x29") != std::string::npos) { line = "// prologue"; }
-        else if (mn == "ldp" && ops.find("x29") != std::string::npos) { line = "// epilogue"; }
-        else if ((mn == "sub" || mn == "add") && parts.size() == 3 && parts[0] == "sp" && parts[1] == "sp") {
-            line = "// stack " + mn + " " + parts[2];
-        }
-        else if (mn == "mov" && parts.size() == 2 && parts[0] == "x29") { line = "// frame setup"; }
-        // ret
-        else if (mn == "ret") { line = "return arg0;"; }
-        // mov
-        else if ((mn == "mov" || mn == "movz") && parts.size() == 2) {
-            line = regName(parts[0]) + " = " + regName(parts[1]) + ";";
-        }
-        else if (mn == "movk" && parts.size() == 2) {
-            line = regName(parts[0]) + " |= " + parts[1] + ";";
-        }
-        // add/sub
-        else if ((mn == "add" || mn == "sub") && parts.size() == 3) {
-            std::string p2 = parts[2]; if (p2[0] == '#') p2 = p2.substr(1);
-            std::string op = (mn == "sub") ? " - " : " + ";
-            if (parts[0] == parts[1])
-                line = regName(parts[0]) + (mn == "sub" ? " -= " : " += ") + p2 + ";";
-            else
-                line = regName(parts[0]) + " = " + regName(parts[1]) + op + p2 + ";";
-        }
-        // subs = compare (when dst is wzr/xzr) or subtract-with-flags
-        else if (mn == "subs" && parts.size() == 3) {
-            std::string p2 = parts[2]; if (p2[0] == '#') p2 = p2.substr(1);
-            if (parts[0] == "wzr" || parts[0] == "xzr")
-                line = "if (" + regName(parts[1]) + " - " + p2 + ")";  // cmp
-            else
-                line = regName(parts[0]) + " = " + regName(parts[1]) + " - " + p2 + ";  // sets flags";
-        }
-        // load (including stur/ldur variants)
-        else if ((mn == "ldr" || mn == "ldrsw" || mn == "ldrb" || mn == "ldrh" ||
-                  mn == "ldur" || mn == "ldursw" || mn == "ldurb" || mn == "ldurh") && parts.size() == 2) {
-            std::string ty = (mn == "ldrb" || mn == "ldurb") ? "(uint8_t)" :
-                             (mn == "ldrh" || mn == "ldurh") ? "(uint16_t)" : "";
-            line = regName(parts[0]) + " = " + ty + memExpr(parts[1]) + ";";
-
-            // 尝试解析实际内存地址并注释
-            auto bracket = parts[1].find('[');
-            auto comma = parts[1].find(',', bracket);
-            if (bracket != std::string::npos) {
-                auto closeBracket = parts[1].find(']');
-                std::string baseReg = (comma != std::string::npos)
-                    ? parts[1].substr(bracket + 1, comma - bracket - 1)
-                    : parts[1].substr(bracket + 1, closeBracket - bracket - 1);
-                while (!baseReg.empty() && baseReg.back() == ' ') baseReg.pop_back();
-                while (!baseReg.empty() && baseReg.front() == ' ') baseReg = baseReg.substr(1);
-
-                auto it = regTrack.find(baseReg);
-                if (it != regTrack.end()) {
-                    addr_t memAddr = it->second;
-                    if (comma != std::string::npos) {
-                        std::string offStr = parts[1].substr(comma + 1, closeBracket - comma - 1);
-                        while (!offStr.empty() && offStr.front() == ' ') offStr = offStr.substr(1);
-                        if (offStr[0] == '#') offStr = offStr.substr(1);
-                        try {
-                            if (offStr[0] == '-') memAddr -= std::stoull(offStr.substr(1), nullptr, 0);
-                            else memAddr += std::stoull(offStr, nullptr, 0);
-                        } catch (...) {}
-                    }
-
-                    // 尝试用符号解析
-                    auto symName = syms_.resolve(memAddr);
-                    if (!symName.empty()) {
-                        comment = symName;
-                    } else {
-                        // 尝试读指针值
-                        auto pv = mem_->read<addr_t>(memAddr);
-                        if (pv && *pv > 0x1000) {
-                            auto sn = syms_.resolveWithOffset(untag(*pv));
-                            if (!sn.empty()) comment = "-> " + sn;
-                        }
-                    }
-                }
-            }
-        }
-        // store (including stur variants)
-        else if ((mn == "str" || mn == "strb" || mn == "strh" ||
-                  mn == "stur" || mn == "sturb" || mn == "sturh") && parts.size() == 2) {
-            line = memExpr(parts[1]) + " = " + regName(parts[0]) + ";";
-        }
-        // stp (store pair)
-        else if (mn == "stp" && parts.size() == 3) {
-            line = memExpr(parts[2]) + " = {" + regName(parts[0]) + ", " + regName(parts[1]) + "};";
-        }
-        // ldp (load pair)
-        else if (mn == "ldp" && parts.size() == 3) {
-            line = "{" + regName(parts[0]) + ", " + regName(parts[1]) + "} = " + memExpr(parts[2]) + ";";
-        }
-        // cmp
-        else if (mn == "cmp" && parts.size() == 2) {
-            std::string p1 = parts[1]; if (!p1.empty() && p1[0] == '#') p1 = p1.substr(1);
-            line = "if (" + regName(parts[0]) + " cmp " + p1 + ")";
-        }
-        // conditional branch
-        else if (mn == "cbz" && parts.size() == 2)
-            line = "if (" + regName(parts[0]) + " == 0) goto " + parts[1] + ";";
-        else if (mn == "cbnz" && parts.size() == 2)
-            line = "if (" + regName(parts[0]) + " != 0) goto " + parts[1] + ";";
-        else if (mn == "tbz" && parts.size() == 3)
-            line = "if (!(" + regName(parts[0]) + " & (1 << " + parts[1] + "))) goto " + parts[2] + ";";
-        else if (mn == "tbnz" && parts.size() == 3)
-            line = "if (" + regName(parts[0]) + " & (1 << " + parts[1] + ")) goto " + parts[2] + ";";
-        else if (mn.size() >= 2 && mn[0] == 'b' && mn[1] == '.')
-            line = "if (" + mn.substr(2) + ") goto " + ops + ";";
-        // branch
-        else if (mn == "b") { line = "goto " + ops + ";"; }
-        else if (mn == "bl") {
-            addr_t callTarget = 0;
-            std::string rawAddr = ops.substr(ops[0] == '#' ? 1 : 0);
-            try { callTarget = untag(std::stoull(rawAddr, nullptr, 16)); } catch (...) {}
-
-            // 查符号表
-            std::string fname = syms_.resolve(callTarget);
-            if (fname.empty()) fname = syms_.resolveWithOffset(callTarget);
-            if (!fname.empty())
-                line = fname + "();";
-            else if (callTarget == funcStart)
-                line = "sub_" + rawAddr + "();  // recursive";
-            else
-                line = "sub_" + rawAddr + "();";
-        }
-        else if (mn == "blr") { line = "(*" + regName(ops) + ")();  // indirect call"; }
-        else if (mn == "br") { line = "goto *" + regName(ops) + ";"; }
-        // adr
-        else if (mn == "adr" || mn == "adrp") {
-            if (parts.size() == 2) line = regName(parts[0]) + " = " + parts[1] + ";  // addr";
-            else line = mn + " " + ops + ";";
-        }
-        // madd/msub
-        else if (mn == "madd" && parts.size() == 4)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " * " + regName(parts[2]) + " + " + regName(parts[3]) + ";";
-        else if (mn == "msub" && parts.size() == 4)
-            line = regName(parts[0]) + " = " + regName(parts[3]) + " - " + regName(parts[1]) + " * " + regName(parts[2]) + ";";
-        // logic
-        else if ((mn == "and" || mn == "orr" || mn == "eor") && parts.size() == 3) {
-            std::string op = (mn == "and") ? " & " : (mn == "orr") ? " | " : " ^ ";
-            line = regName(parts[0]) + " = " + regName(parts[1]) + op + regName(parts[2]) + ";";
-        }
-        else if (mn == "lsl" && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " << " + parts[2] + ";";
-        else if ((mn == "lsr" || mn == "asr") && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " >> " + parts[2] + ";";
-        // csel
-        else if (mn == "csel" && parts.size() == 4)
-            line = regName(parts[0]) + " = " + parts[3] + " ? " + regName(parts[1]) + " : " + regName(parts[2]) + ";";
-        else if (mn == "cset" && parts.size() == 2)
-            line = regName(parts[0]) + " = " + parts[1] + " ? 1 : 0;";
-        // 浮点
-        else if (mn == "fmov" && parts.size() == 2)
-            line = regName(parts[0]) + " = (float)" + regName(parts[1]) + ";";
-        else if (mn == "fcvt" && parts.size() == 2)
-            line = regName(parts[0]) + " = (double)" + regName(parts[1]) + ";";
-        else if (mn == "scvtf" && parts.size() == 2)
-            line = regName(parts[0]) + " = (float)" + regName(parts[1]) + ";";
-        else if (mn == "fcvtzs" && parts.size() == 2)
-            line = regName(parts[0]) + " = (int)" + regName(parts[1]) + ";";
-        else if (mn == "fadd" && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " + " + regName(parts[2]) + ";  // float";
-        else if (mn == "fsub" && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " - " + regName(parts[2]) + ";  // float";
-        else if (mn == "fmul" && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " * " + regName(parts[2]) + ";  // float";
-        else if (mn == "fdiv" && parts.size() == 3)
-            line = regName(parts[0]) + " = " + regName(parts[1]) + " / " + regName(parts[2]) + ";  // float";
-        else if (mn == "fcmp" && parts.size() == 2)
-            line = "if (" + regName(parts[0]) + " fcmp " + regName(parts[1]) + ")";
-        // 默认
-        else {
-            line = "/* " + mn + " " + ops + " */";  // 未识别指令保留原始
-        }
-
-        // 输出
-        if (isTarget)
-            printf("  " Y ">>  " RST BLD W "%s" RST, line.c_str());
-        else if (line.find("//") == 0)
-            printf("      " D "%s" RST, line.c_str());
-        else if (line.find("return") == 0)
-            printf("      " R "%s" RST, line.c_str());
-        else if (line.find("if ") == 0 || line.find("goto ") == 0)
-            printf("      " Y "%s" RST, line.c_str());
-        else if (line.find("();") != std::string::npos)
-            printf("      " C "%s" RST, line.c_str());
+    for (const auto& dl : result.lines) {
+        if (dl.isTarget)
+            printf("  " Y ">>  " RST BLD W "%s" RST, dl.code.c_str());
+        else if (dl.code.find("//") == 0)
+            printf("      " D "%s" RST, dl.code.c_str());
+        else if (dl.code.find("return") == 0)
+            printf("      " R "%s" RST, dl.code.c_str());
+        else if (dl.code.find("if ") == 0 || dl.code.find("goto ") == 0)
+            printf("      " Y "%s" RST, dl.code.c_str());
+        else if (dl.code.find("();") != std::string::npos)
+            printf("      " C "%s" RST, dl.code.c_str());
         else
-            printf("      " W "%s" RST, line.c_str());
+            printf("      " W "%s" RST, dl.code.c_str());
 
-        if (!comment.empty())
-            printf(D "  // " RST M "%s" RST D "  %lx\n" RST, comment.c_str(), (unsigned long)insn[i].address);
+        if (!dl.comment.empty())
+            printf(D "  // " RST M "%s" RST D "  %lx\n" RST, dl.comment.c_str(), (unsigned long)dl.address);
         else
-            printf(D "  // %lx\n" RST, (unsigned long)insn[i].address);
-        record("    %s  // %s %lx\n", line.c_str(), comment.c_str(), (unsigned long)insn[i].address);
+            printf(D "  // %lx\n" RST, (unsigned long)dl.address);
+        record("    %s  // %s %lx\n", dl.code.c_str(), dl.comment.c_str(), (unsigned long)dl.address);
     }
 
     printf("  " C "}" RST "\n");
     record("}\n");
-    cs_free(insn, n);
-    cs_close(&cs);
     puts("");
 }
 
 void UI::cmdCall(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached() || !remote_) return;
+    if (!ensureAttached() || !remote_) return;
 
     std::istringstream iss(arg);
     std::string addrStr;
@@ -1959,8 +1537,7 @@ void UI::cmdCall(const std::string& arg) {
 }
 
 void UI::cmdHook(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached() || !remote_) return;
+    if (!ensureAttached() || !remote_) return;
 
     std::istringstream iss(arg);
     std::string sub;
@@ -2048,8 +1625,7 @@ void UI::cmdHook(const std::string& arg) {
 }
 
 void UI::cmdScan(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     if (arg.empty()) {
         printf("\n  " R "x" RST " 用法: " W "scan <地址>\n" RST);
@@ -2162,8 +1738,7 @@ void UI::cmdDump(const std::string& arg) {
 
 // ── readval 读值 ──
 void UI::cmdReadval(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string addrStr, typeStr;
@@ -2235,8 +1810,7 @@ void UI::cmdReadval(const std::string& arg) {
 
 // ── search 搜值 ──
 void UI::cmdSearch(const std::string& arg) {
-    ensureAttached();
-    if (!proc_.isAttached()) return;
+    if (!ensureAttached()) return;
 
     std::istringstream iss(arg);
     std::string typeStr, valueStr;

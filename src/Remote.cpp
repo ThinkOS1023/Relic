@@ -126,6 +126,9 @@ Remote::CallResult Remote::call(addr_t funcAddr, const std::vector<addr_t>& args
 
 // ── 远程 mmap ──
 addr_t Remote::remoteAlloc(size_t size) {
+    // size 超过 64KB 时 shellcode 编码不正确, 拒绝分配
+    if (size > 0xFFFF) return 0;
+
     // 在目标进程调 mmap(0, size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
     // ARM64 Linux: mmap 是 syscall #222
     // 但直接调 libc 的 mmap 更简单 — 找 mmap 的 PLT 地址
@@ -156,13 +159,6 @@ addr_t Remote::remoteAlloc(size_t size) {
     code[4] = 0xAA3F03E4; // orn x4, xzr, xzr = mvn x4, xzr 不对
     // mvn Xd, Xm = orn Xd, xzr, Xm → 编码复杂, 用 movn 更简单
     code[4] = 0x92800004; // movn x4, #0 → x4 = ~0 = -1
-
-    // 处理 size > 65535 的情况
-    if (size > 0xFFFF) {
-        code[1] = 0xD2800001 | (static_cast<uint32_t>(size & 0xFFFF) << 5);
-        // 需要 movk 设高位, 简单起见限制 size <= 64KB
-        // 对于更大的, 用两条指令
-    }
 
     auto result = execShellcode({reinterpret_cast<uint8_t*>(code),
                                   reinterpret_cast<uint8_t*>(code) + sizeof(code)});

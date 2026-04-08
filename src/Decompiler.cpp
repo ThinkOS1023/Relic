@@ -1,0 +1,346 @@
+#include "TsEngine/Decompiler.h"
+
+#include <cstdio>
+#include <cstring>
+#include <unordered_map>
+#include <capstone/capstone.h>
+
+namespace TsEngine {
+
+// ── 辅助函数 ──
+
+static std::vector<std::string> splitOps(const char* ops) {
+    std::vector<std::string> r;
+    std::string s = ops;
+    int bracket = 0;
+    size_t start = 0;
+    for (size_t p = 0; p <= s.size(); p++) {
+        if (p < s.size() && s[p] == '[') bracket++;
+        if (p < s.size() && s[p] == ']') bracket--;
+        if ((p == s.size() || (s[p] == ',' && bracket == 0))) {
+            auto b = s.find_first_not_of(" ", start);
+            auto e = s.find_last_not_of(" ", p > 0 ? p - 1 : 0);
+            if (b != std::string::npos && b <= e)
+                r.push_back(s.substr(b, e - b + 1));
+            start = p + 1;
+        }
+    }
+    return r;
+}
+
+static std::string regName(const std::string& r) {
+    if (r.empty()) return r;
+    if (r == "wzr" || r == "xzr") return "0";
+    if (r == "sp") return "sp";
+    if ((r[0] == 'w' || r[0] == 'x') && r.size() <= 3) {
+        int n = std::atoi(r.c_str() + 1);
+        if (n <= 7) return "arg" + std::to_string(n);
+        return "v" + std::to_string(n);
+    }
+    return r;
+}
+
+static std::string memExpr(const std::string& mem) {
+    auto b = mem.find('[');
+    auto e = mem.find(']');
+    if (b == std::string::npos) return mem;
+    std::string inner = mem.substr(b + 1, e - b - 1);
+
+    auto comma = inner.find(',');
+    if (comma == std::string::npos) {
+        return "*" + regName(inner);
+    }
+    std::string base = inner.substr(0, comma);
+    std::string off = inner.substr(comma + 1);
+    while (!base.empty() && base.back() == ' ') base.pop_back();
+    while (!off.empty() && off.front() == ' ') off = off.substr(1);
+    if (!off.empty() && off[0] == '#') off = off.substr(1);
+
+    std::string bn = regName(base);
+    if (off == "0" || off == "0x0") return "*" + bn;
+    return "*(" + bn + " + " + off + ")";
+}
+
+// ── 反编译主逻辑 ──
+
+DecompileResult decompile(
+    const Memory& mem, const Symbols& syms,
+    addr_t funcStart, addr_t funcEnd,
+    addr_t targetAddr,
+    const uint8_t* data, size_t dataSize)
+{
+    DecompileResult result;
+    result.funcStart = funcStart;
+    result.funcEnd = funcEnd;
+    result.stackFrame = 0;
+
+    csh cs;
+    if (cs_open(CS_ARCH_ARM64, CS_MODE_ARM, &cs) != CS_ERR_OK) return result;
+    cs_option(cs, CS_OPT_DETAIL, CS_OPT_ON);
+
+    cs_insn* insn;
+    size_t n = cs_disasm(cs, data, dataSize, funcStart, 0, &insn);
+    if (n == 0) { cs_close(&cs); return result; }
+
+    // 分析参数寄存器使用
+    bool usesArg[8] = {};
+    for (size_t i = 0; i < n; i++) {
+        std::string ops = insn[i].op_str;
+        for (int a = 0; a < 8; a++) {
+            char wr[4], xr[4];
+            snprintf(wr, 4, "w%d", a);
+            snprintf(xr, 4, "x%d", a);
+            if (ops.find(wr) != std::string::npos || ops.find(xr) != std::string::npos)
+                usesArg[a] = true;
+        }
+        std::string mn = insn[i].mnemonic;
+        if (mn == "sub" && ops.find("sp, sp") != std::string::npos) {
+            auto h = ops.find("#0x");
+            if (h != std::string::npos) {
+                try { result.stackFrame = std::stoi(ops.substr(h + 1), nullptr, 16); } catch (...) {}
+            }
+        }
+    }
+
+    // 函数名
+    result.funcName = syms.resolve(funcStart);
+    if (result.funcName.empty()) {
+        char buf[32]; snprintf(buf, sizeof(buf), "sub_%lx", (unsigned long)funcStart);
+        result.funcName = buf;
+    }
+
+    // 签名
+    result.signature = "int64_t " + result.funcName + "(";
+    bool first = true;
+    for (int a = 0; a < 8; a++) {
+        if (!usesArg[a]) continue;
+        if (!first) result.signature += ", ";
+        result.signature += "int64_t arg" + std::to_string(a);
+        first = false;
+    }
+    if (first) result.signature += "void";
+    result.signature += ")";
+
+    // 寄存器值跟踪
+    std::unordered_map<std::string, addr_t> regTrack;
+
+    // 翻译每条指令
+    for (size_t i = 0; i < n; i++) {
+        std::string mn = insn[i].mnemonic;
+        std::string ops = insn[i].op_str;
+        auto parts = splitOps(insn[i].op_str);
+        bool isTarget = (insn[i].address == targetAddr);
+
+        std::string line;
+        std::string comment;
+
+        // 寄存器跟踪: adrp/adr/add/mov
+        if (mn == "adrp" && parts.size() == 2) {
+            addr_t val = 0;
+            try { val = untag(std::stoull(parts[1].substr(parts[1][0] == '#' ? 1 : 0), nullptr, 16)); } catch (...) {}
+            if (val) regTrack[parts[0]] = val;
+        }
+        if (mn == "adr" && parts.size() == 2) {
+            addr_t val = 0;
+            try { val = untag(std::stoull(parts[1].substr(parts[1][0] == '#' ? 1 : 0), nullptr, 16)); } catch (...) {}
+            if (val) regTrack[parts[0]] = val;
+        }
+        if (mn == "add" && parts.size() == 3 && parts[0] == parts[1]) {
+            auto it = regTrack.find(parts[0]);
+            if (it != regTrack.end()) {
+                std::string imm = parts[2];
+                if (!imm.empty() && imm[0] == '#') imm = imm.substr(1);
+                try { it->second += std::stoull(imm, nullptr, 16); } catch (...) {}
+            }
+        }
+        if ((mn == "mov" || mn == "movz") && parts.size() == 2) {
+            std::string imm = parts[1];
+            if (!imm.empty() && imm[0] == '#') {
+                try { regTrack[parts[0]] = std::stoull(imm.substr(1), nullptr, 0); } catch (...) {}
+            }
+        }
+
+        // bl 前检查 x0 字符串
+        if (mn == "bl") {
+            auto it = regTrack.find("x0");
+            if (it != regTrack.end() && it->second > 0x1000) {
+                auto s = mem.readString(it->second, 80);
+                if (s && !s->empty() && s->size() > 1) {
+                    std::string str = *s;
+                    if (str.size() > 50) str = str.substr(0, 50) + "...";
+                    for (auto& c : str) { if (c == '\n') c = ' '; if (c == '\r') c = ' '; }
+                    comment = "\"" + str + "\"";
+                }
+            }
+            regTrack.erase("x0");
+        }
+        if (mn == "bl" || mn == "blr") {
+            for (int a = 0; a <= 18; a++) {
+                char r[4]; snprintf(r, 4, "x%d", a);
+                regTrack.erase(r);
+            }
+        }
+
+        if (mn == "nop") continue;
+
+        // 指令翻译
+        if (mn == "stp" && ops.find("x29") != std::string::npos) { line = "// prologue"; }
+        else if (mn == "ldp" && ops.find("x29") != std::string::npos) { line = "// epilogue"; }
+        else if ((mn == "sub" || mn == "add") && parts.size() == 3 && parts[0] == "sp" && parts[1] == "sp") {
+            line = "// stack " + mn + " " + parts[2];
+        }
+        else if (mn == "mov" && parts.size() == 2 && parts[0] == "x29") { line = "// frame setup"; }
+        else if (mn == "ret") { line = "return arg0;"; }
+        else if ((mn == "mov" || mn == "movz") && parts.size() == 2) {
+            line = regName(parts[0]) + " = " + regName(parts[1]) + ";";
+        }
+        else if (mn == "movk" && parts.size() == 2) {
+            line = regName(parts[0]) + " |= " + parts[1] + ";";
+        }
+        else if ((mn == "add" || mn == "sub") && parts.size() == 3) {
+            std::string p2 = parts[2]; if (!p2.empty() && p2[0] == '#') p2 = p2.substr(1);
+            std::string op = (mn == "sub") ? " - " : " + ";
+            if (parts[0] == parts[1])
+                line = regName(parts[0]) + (mn == "sub" ? " -= " : " += ") + p2 + ";";
+            else
+                line = regName(parts[0]) + " = " + regName(parts[1]) + op + p2 + ";";
+        }
+        else if (mn == "subs" && parts.size() == 3) {
+            std::string p2 = parts[2]; if (!p2.empty() && p2[0] == '#') p2 = p2.substr(1);
+            if (parts[0] == "wzr" || parts[0] == "xzr")
+                line = "if (" + regName(parts[1]) + " - " + p2 + ")";
+            else
+                line = regName(parts[0]) + " = " + regName(parts[1]) + " - " + p2 + ";  // sets flags";
+        }
+        else if ((mn == "ldr" || mn == "ldrsw" || mn == "ldrb" || mn == "ldrh" ||
+                  mn == "ldur" || mn == "ldursw" || mn == "ldurb" || mn == "ldurh") && parts.size() == 2) {
+            std::string ty = (mn == "ldrb" || mn == "ldurb") ? "(uint8_t)" :
+                             (mn == "ldrh" || mn == "ldurh") ? "(uint16_t)" : "";
+            line = regName(parts[0]) + " = " + ty + memExpr(parts[1]) + ";";
+
+            auto bracket = parts[1].find('[');
+            auto comma = parts[1].find(',', bracket);
+            if (bracket != std::string::npos) {
+                auto closeBracket = parts[1].find(']');
+                std::string baseReg = (comma != std::string::npos)
+                    ? parts[1].substr(bracket + 1, comma - bracket - 1)
+                    : parts[1].substr(bracket + 1, closeBracket - bracket - 1);
+                while (!baseReg.empty() && baseReg.back() == ' ') baseReg.pop_back();
+                while (!baseReg.empty() && baseReg.front() == ' ') baseReg = baseReg.substr(1);
+
+                auto it = regTrack.find(baseReg);
+                if (it != regTrack.end()) {
+                    addr_t memAddr = it->second;
+                    if (comma != std::string::npos) {
+                        std::string offStr = parts[1].substr(comma + 1, closeBracket - comma - 1);
+                        while (!offStr.empty() && offStr.front() == ' ') offStr = offStr.substr(1);
+                        if (!offStr.empty() && offStr[0] == '#') offStr = offStr.substr(1);
+                        try {
+                            if (!offStr.empty() && offStr[0] == '-') memAddr -= std::stoull(offStr.substr(1), nullptr, 0);
+                            else memAddr += std::stoull(offStr, nullptr, 0);
+                        } catch (...) {}
+                    }
+                    auto symName = syms.resolve(memAddr);
+                    if (!symName.empty()) {
+                        comment = symName;
+                    } else {
+                        auto pv = mem.read<addr_t>(memAddr);
+                        if (pv && *pv > 0x1000) {
+                            auto sn = syms.resolveWithOffset(untag(*pv));
+                            if (!sn.empty()) comment = "-> " + sn;
+                        }
+                    }
+                }
+            }
+        }
+        else if ((mn == "str" || mn == "strb" || mn == "strh" ||
+                  mn == "stur" || mn == "sturb" || mn == "sturh") && parts.size() == 2) {
+            line = memExpr(parts[1]) + " = " + regName(parts[0]) + ";";
+        }
+        else if (mn == "stp" && parts.size() == 3) {
+            line = memExpr(parts[2]) + " = {" + regName(parts[0]) + ", " + regName(parts[1]) + "};";
+        }
+        else if (mn == "ldp" && parts.size() == 3) {
+            line = "{" + regName(parts[0]) + ", " + regName(parts[1]) + "} = " + memExpr(parts[2]) + ";";
+        }
+        else if (mn == "cmp" && parts.size() == 2) {
+            std::string p1 = parts[1]; if (!p1.empty() && p1[0] == '#') p1 = p1.substr(1);
+            line = "if (" + regName(parts[0]) + " cmp " + p1 + ")";
+        }
+        else if (mn == "cbz" && parts.size() == 2)
+            line = "if (" + regName(parts[0]) + " == 0) goto " + parts[1] + ";";
+        else if (mn == "cbnz" && parts.size() == 2)
+            line = "if (" + regName(parts[0]) + " != 0) goto " + parts[1] + ";";
+        else if (mn == "tbz" && parts.size() == 3)
+            line = "if (!(" + regName(parts[0]) + " & (1 << " + parts[1] + "))) goto " + parts[2] + ";";
+        else if (mn == "tbnz" && parts.size() == 3)
+            line = "if (" + regName(parts[0]) + " & (1 << " + parts[1] + ")) goto " + parts[2] + ";";
+        else if (mn.size() >= 2 && mn[0] == 'b' && mn[1] == '.')
+            line = "if (" + mn.substr(2) + ") goto " + ops + ";";
+        else if (mn == "b") { line = "goto " + ops + ";"; }
+        else if (mn == "bl") {
+            addr_t callTarget = 0;
+            std::string rawAddr = ops.substr(ops[0] == '#' ? 1 : 0);
+            try { callTarget = untag(std::stoull(rawAddr, nullptr, 16)); } catch (...) {}
+            std::string fname = syms.resolve(callTarget);
+            if (fname.empty()) fname = syms.resolveWithOffset(callTarget);
+            if (!fname.empty())
+                line = fname + "();";
+            else if (callTarget == funcStart)
+                line = "sub_" + rawAddr + "();  // recursive";
+            else
+                line = "sub_" + rawAddr + "();";
+        }
+        else if (mn == "blr") { line = "(*" + regName(ops) + ")();  // indirect call"; }
+        else if (mn == "br") { line = "goto *" + regName(ops) + ";"; }
+        else if (mn == "adr" || mn == "adrp") {
+            if (parts.size() == 2) line = regName(parts[0]) + " = " + parts[1] + ";  // addr";
+            else line = mn + " " + ops + ";";
+        }
+        else if (mn == "madd" && parts.size() == 4)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " * " + regName(parts[2]) + " + " + regName(parts[3]) + ";";
+        else if (mn == "msub" && parts.size() == 4)
+            line = regName(parts[0]) + " = " + regName(parts[3]) + " - " + regName(parts[1]) + " * " + regName(parts[2]) + ";";
+        else if ((mn == "and" || mn == "orr" || mn == "eor") && parts.size() == 3) {
+            std::string op = (mn == "and") ? " & " : (mn == "orr") ? " | " : " ^ ";
+            line = regName(parts[0]) + " = " + regName(parts[1]) + op + regName(parts[2]) + ";";
+        }
+        else if (mn == "lsl" && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " << " + parts[2] + ";";
+        else if ((mn == "lsr" || mn == "asr") && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " >> " + parts[2] + ";";
+        else if (mn == "csel" && parts.size() == 4)
+            line = regName(parts[0]) + " = " + parts[3] + " ? " + regName(parts[1]) + " : " + regName(parts[2]) + ";";
+        else if (mn == "cset" && parts.size() == 2)
+            line = regName(parts[0]) + " = " + parts[1] + " ? 1 : 0;";
+        else if (mn == "fmov" && parts.size() == 2)
+            line = regName(parts[0]) + " = (float)" + regName(parts[1]) + ";";
+        else if (mn == "fcvt" && parts.size() == 2)
+            line = regName(parts[0]) + " = (double)" + regName(parts[1]) + ";";
+        else if (mn == "scvtf" && parts.size() == 2)
+            line = regName(parts[0]) + " = (float)" + regName(parts[1]) + ";";
+        else if (mn == "fcvtzs" && parts.size() == 2)
+            line = regName(parts[0]) + " = (int)" + regName(parts[1]) + ";";
+        else if (mn == "fadd" && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " + " + regName(parts[2]) + ";  // float";
+        else if (mn == "fsub" && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " - " + regName(parts[2]) + ";  // float";
+        else if (mn == "fmul" && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " * " + regName(parts[2]) + ";  // float";
+        else if (mn == "fdiv" && parts.size() == 3)
+            line = regName(parts[0]) + " = " + regName(parts[1]) + " / " + regName(parts[2]) + ";  // float";
+        else if (mn == "fcmp" && parts.size() == 2)
+            line = "if (" + regName(parts[0]) + " fcmp " + regName(parts[1]) + ")";
+        else {
+            line = "/* " + mn + " " + ops + " */";
+        }
+
+        result.lines.push_back({ line, comment, insn[i].address, isTarget });
+    }
+
+    cs_free(insn, n);
+    cs_close(&cs);
+    return result;
+}
+
+} // namespace TsEngine

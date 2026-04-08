@@ -1,0 +1,130 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+env:
+  PROJECT: TsEngine
+
+jobs:
+  build-aarch64:
+    name: Build (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            ninja-build cmake \
+            qemu-user-static
+
+      - name: Build capstone (aarch64 cross)
+        run: |
+          git clone --depth 1 --branch 5.0.1 https://github.com/capstone-engine/capstone.git /tmp/capstone
+          cd /tmp/capstone
+          mkdir build && cd build
+          cmake .. -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCAPSTONE_BUILD_SHARED=OFF \
+            -DCAPSTONE_BUILD_TESTS=OFF \
+            -DCAPSTONE_BUILD_CSTOOL=OFF \
+            -DCMAKE_INSTALL_PREFIX=/tmp/capstone-install
+          ninja -j$(nproc)
+          ninja install
+
+      - name: Build TsEngine (aarch64 cross)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/tmp/capstone-install \
+            -DCMAKE_FIND_ROOT_PATH=/tmp/capstone-install \
+            -DCMAKE_EXE_LINKER_FLAGS="-static"
+          cmake --build build -j$(nproc)
+
+      - name: Strip binary
+        run: aarch64-linux-gnu-strip build/${{ env.PROJECT }}
+
+      - name: Verify binary
+        run: |
+          file build/${{ env.PROJECT }}
+          ls -lh build/${{ env.PROJECT }}
+
+      - name: Build test target (aarch64)
+        run: |
+          aarch64-linux-gnu-g++ -o build/target test/target.cpp -O0 -g -static || true
+
+      - name: Package
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DIR="${{ env.PROJECT }}"
+          mkdir -p "$DIR"
+          cp build/${{ env.PROJECT }} "$DIR/"
+          cp README.md "$DIR/" 2>/dev/null || true
+          [ -f build/target ] && cp build/target "$DIR/"
+          tar czf "${{ env.PROJECT }}-${TAG}-aarch64.tar.gz" "$DIR/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT }}-aarch64
+          path: ${{ env.PROJECT }}-*-aarch64.tar.gz
+
+  release:
+    name: Create Release
+    needs: build-aarch64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ env.PROJECT }} ${{ github.event.inputs.tag || github.ref_name }}
+          body: |
+            ## ${{ env.PROJECT }} ${{ github.event.inputs.tag || github.ref_name }}
+
+            Android ARM64 进程调试工具
+
+            ### 安装 (Termux)
+            ```bash
+            tar xzf ${{ env.PROJECT }}-*-aarch64.tar.gz
+            cp ${{ env.PROJECT }}/${{ env.PROJECT }} $PREFIX/bin/
+            pkg install capstone
+            ```
+
+            ### 运行
+            ```bash
+            TsEngine
+            ```
+          files: artifacts/*
+          draft: false
+          prerelease: false

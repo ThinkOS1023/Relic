@@ -1,4 +1,6 @@
 build/
+release/
+*.tar.gz
 *.o
 *.d
 .cache/
