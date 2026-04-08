@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <capstone/capstone.h>
+#include <keystone/keystone.h>
 
 namespace TsEngine {
 
@@ -243,6 +244,8 @@ void UI::printHelp() {
     printf("    " BLD W "patch" RST " <地址> ret       写 RET (跳过函数)\n");
     printf("    " BLD W "patch" RST " <地址> ret0      MOV X0,#0 + RET\n");
     printf("    " BLD W "patch" RST " <地址> hex <值>  写原始指令\n");
+    printf("    " BLD W "patch" RST " <地址> <汇编>    ARM64 汇编 (keystone)\n");
+    printf(D "          如: " W "add w8, w8, #100" D " / " W "mov w0, #999\n" RST);
     puts("");
 
     // Hook
@@ -1225,9 +1228,38 @@ void UI::cmdPatch(const std::string& arg) {
         }
     }
     else {
-        printf("\n  " R "x" RST " 未知指令: %s\n", firstWord.c_str());
-        printf(D "    可用: nop ret ret0 ret1 mov0 mov1 brk hex\n" RST "\n");
-        return;
+        // 尝试用 keystone 汇编
+        ks_engine* ks;
+        if (ks_open(KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN, &ks) != KS_ERR_OK) {
+            printf("\n  " R "x" RST " 汇编器初始化失败\n\n");
+            return;
+        }
+
+        unsigned char* encode = nullptr;
+        size_t encSize = 0, statCount = 0;
+        // what 是完整的汇编文本 (可能多条, 用 ; 分隔)
+        int rc = ks_asm(ks, what.c_str(), addr, &encode, &encSize, &statCount);
+
+        if (rc != 0 || encSize == 0) {
+            printf("\n  " R "x" RST " 汇编失败: %s\n", ks_strerror(ks_errno(ks)));
+            printf(D "    输入: %s\n" RST, what.c_str());
+            printf(D "    快捷: nop ret ret0 ret1 mov0 mov1 brk\n" RST);
+            printf(D "    示例: " W "patch <地址> add w8, w8, #100\n" RST);
+            printf(D "          " W "patch <地址> mov w0, #999\n" RST);
+            printf(D "          " W "patch <地址> sub w8, w8, w10\n" RST "\n");
+            ks_close(ks);
+            return;
+        }
+
+        // 每 4 字节一条指令
+        for (size_t i = 0; i + 3 < encSize; i += 4) {
+            uint32_t inst;
+            std::memcpy(&inst, encode + i, 4);
+            instructions.push_back(inst);
+        }
+
+        ks_free(encode);
+        ks_close(ks);
     }
 
     if (instructions.empty()) {
