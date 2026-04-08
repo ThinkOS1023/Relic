@@ -10,13 +10,15 @@
 namespace TsEngine {
 
 // 找一个代码段地址当临时 BRK 陷阱
+// 用代码段末尾 (对齐填充区域), 避免覆盖活跃代码
 addr_t Remote::findTrapAddr() {
     if (trapAddr_) return trapAddr_;
 
     maps_.refresh();
     for (const auto& r : maps_.regions()) {
         if (r.executable() && r.size() >= 32 && !r.path.empty() && r.path[0] == '/') {
-            trapAddr_ = (r.start + r.size() / 2) & ~3UL;
+            // 用段末尾 - 8 的位置 (通常是对齐填充的 00/NOP 区域)
+            trapAddr_ = (r.end - 8) & ~3UL;
             return trapAddr_;
         }
     }
