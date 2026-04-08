@@ -73,12 +73,24 @@ struct Il2cppClassInfo {
     std::vector<Il2cppMethodInfo> methods;
 };
 
+// 反向查找结果: 从字段数据地址反推到所属对象
+struct FieldLookupResult {
+    addr_t instanceAddr;            // 对象实例地址
+    Il2cppClassInfo classInfo;      // 完整类信息
+    std::string matchedFieldName;   // 匹配的字段名 (空=无精确匹配)
+    int32_t matchedFieldOffset;     // 匹配的字段偏移
+};
+
 class Il2cppInspector {
 public:
     Il2cppInspector(const Memory& mem, Il2cppOffsets offsets = {});
 
     // 从实例地址解析对象信息
     std::optional<Il2cppClassInfo> inspectObject(addr_t instanceAddr);
+
+    // 从字段数据地址反推对象实例 + 类信息
+    // 向前扫描找 Il2CppClass* klass 指针, 验证后解析完整类信息
+    std::optional<FieldLookupResult> findObjectByFieldAddr(addr_t fieldAddr);
 
     // 从 Il2CppClass* 地址解析类信息
     std::optional<Il2cppClassInfo> readClass(addr_t klassAddr);
