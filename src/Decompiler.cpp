@@ -386,22 +386,49 @@ DecompileResult decompile(
     size_t n = cs_disasm(cs, data, dataSize, funcStart, 0, &insn);
     if (n == 0) { cs_close(&cs); return result; }
 
-    // 分析参数寄存器使用
+    // 分析参数寄存器使用 (只标记"先读后写"的寄存器为输入参数)
     bool usesArg[8] = {};
+    bool defined[8] = {};  // 已被写入 (不再是输入参数)
     for (size_t i = 0; i < n; i++) {
-        std::string ops = insn[i].op_str;
-        for (int a = 0; a < 8; a++) {
-            char wr[4], xr[4];
-            snprintf(wr, 4, "w%d", a);
-            snprintf(xr, 4, "x%d", a);
-            if (ops.find(wr) != std::string::npos || ops.find(xr) != std::string::npos)
-                usesArg[a] = true;
-        }
         std::string mn = insn[i].mnemonic;
+        std::string ops = insn[i].op_str;
+
+        // 遇到函数调用: x0-x7 全部被破坏, 停止分析
+        if (mn == "bl" || mn == "blr") break;
+
+        // 检测栈帧大小
         if (mn == "sub" && ops.find("sp, sp") != std::string::npos) {
             auto h = ops.find("#0x");
             if (h != std::string::npos) {
                 try { result.stackFrame = std::stoi(ops.substr(h + 1), nullptr, 16); } catch (...) {}
+            }
+        }
+
+        auto parts = splitOps(insn[i].op_str);
+        if (parts.empty()) continue;
+
+        // 判断指令类型: str/stp 第一个操作数是源 (读), 其他指令第一个是目的 (写)
+        bool firstIsSource = (mn == "str" || mn == "strb" || mn == "strh" ||
+                              mn == "stp" || mn == "stur" || mn == "sturb" || mn == "sturh" ||
+                              mn == "cmp" || mn == "tst" || mn == "fcmp" ||
+                              mn == "cbz" || mn == "cbnz" || mn == "tbz" || mn == "tbnz");
+
+        for (size_t p = 0; p < parts.size(); p++) {
+            const auto& op = parts[p];
+            if (op.size() > 3 || op.empty()) continue;
+            if (op[0] != 'w' && op[0] != 'x') continue;
+            int regNum = -1;
+            try { regNum = std::stoi(op.substr(1)); } catch (...) { continue; }
+            if (regNum < 0 || regNum > 7) continue;
+
+            bool isRead = (p > 0) || firstIsSource;
+            bool isWrite = (p == 0) && !firstIsSource;
+
+            if (isRead && !defined[regNum]) {
+                usesArg[regNum] = true;
+            }
+            if (isWrite) {
+                defined[regNum] = true;
             }
         }
     }
