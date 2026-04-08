@@ -334,6 +334,14 @@ void UI::cmdAttach(const std::string& arg) {
         remote_ = std::make_unique<Remote>(pid, *bp_, *mem_, *maps_);
         maps_->refresh();
 
+        // 自动检测 Unity il2cpp 版本并设置偏移
+        {
+            auto il2cppMod = maps_->findModule("libil2cpp.so");
+            if (il2cppMod) {
+                il2cpp_->autoDetectVersion(il2cppMod->start, il2cppMod->size());
+            }
+        }
+
         // 加载所有模块符号
         syms_.clear();
         {
@@ -360,6 +368,8 @@ void UI::cmdAttach(const std::string& arg) {
         int sc = syms_.count();
         printf("\n  " G "✓" RST " 已附加 " BLD W "%s" RST D " (PID:%d)", proc_.name().c_str(), pid);
         if (sc > 0) printf(D "  [%d 符号]", sc);
+        auto& uver = il2cpp_->detectedVersion();
+        if (!uver.empty()) printf(D "  [Unity %s]", uver.c_str());
         printf(RST "\n\n");
     } else {
         printf("\n  " R "✗" RST " 附加失败 PID:%d\n", pid);
@@ -717,6 +727,20 @@ void UI::cmdIl2cpp(const std::string& arg) {
             printf("    大小  " W "%zu" RST " bytes\n", mod->size());
             printf("    权限  " Y "%s\n" RST, mod->perms.c_str());
             printf("    路径  " D "%s\n" RST, mod->path.c_str());
+
+            // 显示检测到的版本
+            auto& ver = il2cpp_->detectedVersion();
+            if (!ver.empty())
+                printf("    Unity " G "%s\n" RST, ver.c_str());
+            else {
+                // 尝试重新检测
+                il2cpp_->autoDetectVersion(mod->start, mod->size());
+                auto& ver2 = il2cpp_->detectedVersion();
+                if (!ver2.empty())
+                    printf("    Unity " G "%s\n" RST, ver2.c_str());
+                else
+                    printf("    Unity " Y "未检测到版本" RST D " (用 " W "il2cpp set <版本>" D " 手动设)\n" RST);
+            }
             puts("");
         } else {
             printf("\n  " R "✗" RST " 未找到 libil2cpp.so\n");
@@ -725,11 +749,50 @@ void UI::cmdIl2cpp(const std::string& arg) {
         return;
     }
 
+    // il2cpp version — 查看当前偏移配置
+    if (arg == "version" || arg == "ver") {
+        auto& ver = il2cpp_->detectedVersion();
+        auto& o = il2cpp_->offsets();
+        puts("");
+        printf(BLD M "  il2cpp 偏移配置\n" RST);
+        line(D, 50);
+        if (!ver.empty())
+            printf("    Unity     " G "%s\n" RST, ver.c_str());
+        else
+            printf("    Unity     " Y "未检测\n" RST);
+        printf("    klass_fields       " C "0x%zx\n" RST, o.klass_fields);
+        printf("    klass_methods      " C "0x%zx\n" RST, o.klass_methods);
+        printf("    klass_field_count  " C "0x%zx\n" RST, o.klass_field_count);
+        printf("    klass_method_count " C "0x%zx\n" RST, o.klass_method_count);
+        printf("    klass_instance_size" C " 0x%zx\n" RST, o.klass_instance_size);
+        printf("    klass_token        " C "0x%zx\n" RST, o.klass_token);
+        printf(D "\n    手动设置: " W "il2cpp set 2020" D " / " W "il2cpp set 2023\n" RST);
+        printf(D "    可用: 2019 2020 2021 2022 2023\n" RST "\n");
+        return;
+    }
+
+    // il2cpp set <版本> — 手动设置偏移预设
+    if (arg.substr(0, 4) == "set ") {
+        std::string ver = arg.substr(4);
+        while (!ver.empty() && ver[0] == ' ') ver = ver.substr(1);
+        if (ver.empty()) {
+            printf("\n  " R "✗" RST " 用法: " W "il2cpp set 2022\n" RST);
+            printf(D "    可用: 2019 2020 2021 2022 2023\n" RST "\n");
+            return;
+        }
+        il2cpp_->setOffsets(il2cppOffsetsForVersion(ver));
+        printf("\n  " G "✓" RST " 偏移已切换到 Unity " W "%s\n" RST, ver.c_str());
+        printf(D "    用 " W "il2cpp version" D " 查看详细偏移\n" RST "\n");
+        return;
+    }
+
     if (arg.empty()) {
         printf("\n  " R "✗" RST " 缺少地址\n");
-        printf(D "    用法: " W "il2cpp 0x12abc000" D "  (实例地址 或 字段地址)\n" RST);
-        printf(D "    或:   " W "il2cpp find" D "        (查找 libil2cpp.so)\n" RST);
-        printf(D "\n    支持字段地址反推: 自动向前扫描找到对象头\n" RST);
+        printf(D "    用法:\n" RST);
+        printf(D "    " W "il2cpp 0x12abc000" D "   解析实例/字段地址\n" RST);
+        printf(D "    " W "il2cpp find" D "         查找 libil2cpp.so + Unity 版本\n" RST);
+        printf(D "    " W "il2cpp version" D "      查看/设置偏移配置\n" RST);
+        printf(D "    " W "il2cpp set 2023" D "     手动切换版本偏移\n" RST);
         puts("");
         return;
     }
