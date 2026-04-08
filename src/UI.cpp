@@ -723,26 +723,48 @@ void UI::cmdIl2cpp(const std::string& arg) {
     }
 
     if (arg.empty()) {
-        printf("\n  " R "✗" RST " 缺少实例地址\n");
-        printf(D "    用法: " W "il2cpp 0x12abc000" D "  (传入 Il2CppObject* 地址)\n" RST);
+        printf("\n  " R "✗" RST " 缺少地址\n");
+        printf(D "    用法: " W "il2cpp 0x12abc000" D "  (实例地址 或 字段地址)\n" RST);
         printf(D "    或:   " W "il2cpp find" D "        (查找 libil2cpp.so)\n" RST);
+        printf(D "\n    支持字段地址反推: 自动向前扫描找到对象头\n" RST);
         puts("");
         return;
     }
 
     try {
         addr_t addr = untag(std::stoull(arg, nullptr, 16));
-        auto info = il2cpp_->inspectObject(addr);
-        if (!info) {
-            printf("\n  " R "✗" RST " 解析失败 @ " C "0x%lx\n" RST, (unsigned long)addr);
-            printf(D "    确认地址是有效的 Il2CppObject* 实例指针\n" RST "\n");
-            return;
-        }
 
-        // ── 类信息 ──
-        puts("");
-        printf(BLD M "  类信息" RST "\n");
-        line(D, 50);
+        // 先尝试作为实例地址解析
+        auto info = il2cpp_->inspectObject(addr);
+        int32_t highlightOffset = -1; // 需要高亮的字段偏移
+
+        if (!info) {
+            // 尝试作为字段数据地址反推
+            auto lookup = il2cpp_->findObjectByFieldAddr(addr);
+            if (!lookup) {
+                printf("\n  " R "✗" RST " 解析失败 @ " C "0x%lx\n" RST, (unsigned long)addr);
+                printf(D "    地址不是有效的 il2cpp 实例或字段\n" RST "\n");
+                return;
+            }
+            info = std::move(lookup->classInfo);
+            highlightOffset = lookup->matchedFieldOffset;
+
+            puts("");
+            printf(BLD M "  类信息" RST D " (从字段地址反推)\n" RST);
+            line(D, 50);
+            printf("    实例      " C "0x%lx\n" RST, (unsigned long)lookup->instanceAddr);
+            if (!lookup->matchedFieldName.empty()) {
+                printf("    匹配字段  " BLD Y "%s" RST D " @ offset " Y "0x%x\n" RST,
+                       lookup->matchedFieldName.c_str(), lookup->matchedFieldOffset);
+            } else {
+                printf("    偏移      " Y "0x%x" RST D " (未匹配到具体字段)\n" RST,
+                       lookup->matchedFieldOffset);
+            }
+        } else {
+            puts("");
+            printf(BLD M "  类信息" RST "\n");
+            line(D, 50);
+        }
 
         printf("    名称      " BLD G "%s%s%s" RST "\n",
                info->nameSpace.empty() ? "" : info->nameSpace.c_str(),
@@ -761,8 +783,13 @@ void UI::cmdIl2cpp(const std::string& arg) {
         printf(D "    %-8s %-14s %s\n" RST, "Offset", "Type", "Name");
 
         for (const auto& f : info->fields) {
-            printf("    " Y "0x%-6x" RST " " D "%-14s" RST " " W "%s\n" RST,
-                   f.offset, f.typeName.c_str(), f.name.c_str());
+            bool match = (f.offset == highlightOffset);
+            if (match)
+                printf("  " Y ">" RST " " Y "0x%-6x" RST " " Y "%-14s" RST " " BLD Y "%s" RST "\n",
+                       f.offset, f.typeName.c_str(), f.name.c_str());
+            else
+                printf("    " Y "0x%-6x" RST " " D "%-14s" RST " " W "%s\n" RST,
+                       f.offset, f.typeName.c_str(), f.name.c_str());
         }
 
         // ── 方法 ──

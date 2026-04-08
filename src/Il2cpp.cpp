@@ -197,6 +197,58 @@ std::vector<Il2cppMethodInfo> Il2cppInspector::readMethods(addr_t klassAddr) {
     return result;
 }
 
+std::optional<FieldLookupResult> Il2cppInspector::findObjectByFieldAddr(addr_t fieldAddr) {
+    // 从 fieldAddr 向前扫描, 步长 8 字节, 最多 4096 字节
+    for (size_t off = 8; off <= 4096; off += 8) {
+        addr_t candidate = fieldAddr - off;
+
+        // 读候选 klass 指针
+        auto klassPtr = mem_.read<addr_t>(candidate + offsets_.object_klass);
+        if (!klassPtr || *klassPtr == 0) continue;
+        addr_t klass = untag(*klassPtr);
+
+        // 验证 klass: 能读到类名字符串?
+        auto namePtr = mem_.read<addr_t>(klass + offsets_.klass_name);
+        if (!namePtr || *namePtr == 0) continue;
+        auto name = mem_.readString(*namePtr, 64);
+        if (!name || name->empty()) continue;
+
+        // 类名应是可打印 ASCII
+        bool valid = true;
+        for (char c : *name) {
+            if (c < 0x20 || c > 0x7e) { valid = false; break; }
+        }
+        if (!valid) continue;
+
+        // 验证 instanceSize
+        auto instSize = mem_.read<uint32_t>(klass + offsets_.klass_instance_size);
+        if (!instSize || *instSize == 0 || *instSize > 0x10000) continue;
+
+        // fieldAddr 必须落在 [candidate, candidate + instanceSize) 内
+        if (off > *instSize) continue;
+
+        // 有效! 解析完整类信息
+        auto classInfo = readClass(klass);
+        if (!classInfo) continue;
+
+        // 找匹配字段
+        int32_t fieldOff = static_cast<int32_t>(off);
+        FieldLookupResult result;
+        result.instanceAddr = candidate;
+        result.classInfo = std::move(*classInfo);
+        result.matchedFieldOffset = fieldOff;
+
+        for (const auto& f : result.classInfo.fields) {
+            if (f.offset == fieldOff) {
+                result.matchedFieldName = f.name;
+                break;
+            }
+        }
+        return result;
+    }
+    return std::nullopt;
+}
+
 std::optional<std::vector<uint8_t>> Il2cppInspector::readFieldValue(
     addr_t instanceAddr, int32_t fieldOffset, size_t size) {
     return mem_.readBuffer(instanceAddr + fieldOffset, size);
