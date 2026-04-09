@@ -317,26 +317,31 @@ std::vector<Il2cppMethodInfo> Il2cppInspector::readMethods(addr_t klassAddr) {
     return result;
 }
 
-// 检查 klass 指针是否指向有效的 Il2CppClass
-// 方法: 检查 klass + 0x28 处的 bitfield1 是否为已知的有效值
-// (参考 GG il2cpp 脚本的验证方式, 比字符串检查快且可靠)
+// 检查候选地址是否是有效的 Il2CppClass*
+// 方法1: klass+0x28 bitfield magic (GG 脚本方式, 快)
+// 方法2: 能否读到可打印类名 (慢但通用)
 bool Il2cppInspector::isValidKlass(addr_t klass) const {
-    auto val = mem_.read<uint32_t>(klass + offsets_.klass_bitfield1);
-    if (!val) return false;
-    uint32_t v = *val;
-    // 已知的有效 bitfield1 值 (不同类类型)
-    // 0x120000 = 普通 class, 0x1D0000 = sealed class, 0x150000 = abstract class
-    // 也检查其他常见值
-    if (v == 0x120000 || v == 0x1D0000 || v == 0x150000 ||
-        v == 0x100000 || v == 0x160000 || v == 0x110000 ||
-        v == 0x1C0000 || v == 0x140000 || v == 0x180000) {
-        return true;
+    // 方法1: bitfield1 检查 (多个已知偏移都试)
+    for (size_t bfOff : { offsets_.klass_bitfield1, (size_t)0x28, (size_t)0x24, (size_t)0x2C }) {
+        auto val = mem_.read<uint32_t>(klass + bfOff);
+        if (!val) continue;
+        uint32_t v = *val;
+        // 低16位为0, 高位在合理范围 → il2cpp class pattern
+        if ((v & 0xFFFF) == 0 && (v >> 16) > 0 && (v >> 16) < 0x40) {
+            return true;
+        }
     }
-    // 备用: 检查低16位为0且高位合理 (il2cpp class bitfield pattern)
-    if ((v & 0xFFFF) == 0 && (v >> 16) > 0 && (v >> 16) < 0x40) {
-        return true;
+
+    // 方法2: 能读到合法类名?
+    auto namePtr = mem_.read<addr_t>(klass + offsets_.klass_name);
+    if (!namePtr || *namePtr == 0) return false;
+    auto name = mem_.readString(untag(*namePtr), 64);
+    if (!name || name->empty() || name->size() < 2) return false;
+    // 类名应是可打印字符
+    for (char c : *name) {
+        if (c < 0x20 || c > 0x7e) return false;
     }
-    return false;
+    return true;
 }
 
 std::optional<FieldLookupResult> Il2cppInspector::findObjectByFieldAddr(addr_t fieldAddr) {
@@ -348,18 +353,18 @@ std::optional<FieldLookupResult> Il2cppInspector::findObjectByFieldAddr(addr_t f
         auto klassPtr = mem_.read<addr_t>(candidate + offsets_.object_klass);
         if (!klassPtr || *klassPtr == 0) continue;
         addr_t klass = untag(*klassPtr);
+        if (klass < 0x1000) continue; // 明显无效
 
-        // 快速验证: klass + 0x28 bitfield 检查
+        // 验证 klass
         if (!isValidKlass(klass)) continue;
 
-        // 进一步验证: instanceSize 合理且 fieldAddr 在范围内
+        // 验证 instanceSize (允许 0 因为某些版本可能读不到)
         auto instSize = mem_.read<uint32_t>(klass + offsets_.klass_instance_size);
-        if (!instSize || *instSize == 0 || *instSize > 0x10000) continue;
-        if (off > *instSize) continue;
+        if (instSize && *instSize > 0 && off > *instSize) continue;
 
         // 有效! 解析完整类信息
         auto classInfo = readClass(klass);
-        if (!classInfo) continue;
+        if (!classInfo || classInfo->name.empty()) continue;
 
         // 找匹配字段
         int32_t fieldOff = static_cast<int32_t>(off);

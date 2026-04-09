@@ -33,8 +33,8 @@ public:
     explicit Breakpoint(pid_t pid) : pid_(pid) {}
     ~Breakpoint();
 
-    bool ptraceAttach();   // 附加所有线程
-    bool ptraceDetach();   // 分离所有线程
+    bool ptraceAttach();
+    bool ptraceDetach();
     [[nodiscard]] bool isAttached() const { return attached_; }
 
     bool add(addr_t addr, bool autoContinue = true);
@@ -50,28 +50,22 @@ public:
 
     std::optional<addr_t> waitHit();
     std::optional<addr_t> pollHit();
-    std::optional<RegState> getRegs() const;      // 主线程寄存器
-    std::optional<RegState> getRegs(pid_t tid) const; // 指定线程寄存器
+    std::optional<RegState> getRegs() const;
     bool setRegs(const RegState& state) const;
     bool continueExec();
     bool stopProcess();
     void resumeProcess(); // CONT + 设 running_
     [[nodiscard]] bool isRunning() const { return running_; }
-    [[nodiscard]] const std::vector<pid_t>& threads() const { return tids_; }
 
 private:
     bool writeInst(addr_t addr, uint32_t inst);
     std::optional<uint32_t> readInst(addr_t addr);
     bool singleStep();
-    bool applyWatchpoints();       // 对所有线程设置观察点
-    bool applyWatchpointsToTid(pid_t tid);
-    bool clearHwWatchpoints();     // 清除所有线程的观察点
-    bool clearHwWatchpointsForTid(pid_t tid);
+    bool applyWatchpoints();
+    bool clearHwWatchpoints();
     int findFreeWatchSlot();
-    std::vector<pid_t> enumThreads();
 
-    pid_t pid_;                    // 进程 PID (= 主线程 TID)
-    std::vector<pid_t> tids_;     // 所有已附加的线程 TID
+    pid_t pid_;
     bool attached_ = false;
     bool running_ = false;
     std::unordered_map<addr_t, BreakpointInfo> bps_;
