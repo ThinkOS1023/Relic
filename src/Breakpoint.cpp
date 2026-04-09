@@ -8,8 +8,6 @@
 #include <cstring>
 #include <cerrno>
 #include <cstddef>
-#include <dirent.h>
-#include <algorithm>
 
 #ifndef NT_ARM_HW_WATCH
 #define NT_ARM_HW_WATCH 0x403
@@ -38,55 +36,19 @@ Breakpoint::~Breakpoint() {
         if (bp.enabled) writeInst(addr, bp.originalInst);
     }
     if (!wps_.empty()) { wps_.clear(); clearHwWatchpoints(); }
-    for (auto tid : tids_) {
-        ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
-    }
-    tids_.clear();
+    ptrace(PTRACE_DETACH, pid_, nullptr, nullptr);
     attached_ = false;
-}
-
-// 枚举进程的所有线程
-std::vector<pid_t> Breakpoint::enumThreads() {
-    std::vector<pid_t> tids;
-    std::string path = "/proc/" + std::to_string(pid_) + "/task";
-    DIR* dir = opendir(path.c_str());
-    if (!dir) return { pid_ };
-
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        char* end = nullptr;
-        long tid = strtol(entry->d_name, &end, 10);
-        if (*end == '\0' && tid > 0)
-            tids.push_back(static_cast<pid_t>(tid));
-    }
-    closedir(dir);
-
-    // 主线程排第一
-    std::sort(tids.begin(), tids.end());
-    auto it = std::find(tids.begin(), tids.end(), pid_);
-    if (it != tids.end()) {
-        std::swap(*tids.begin(), *it);
-    }
-    if (tids.empty()) tids.push_back(pid_);
-    return tids;
 }
 
 bool Breakpoint::ptraceAttach() {
     if (attached_) return true;
+    if (ptrace(PTRACE_ATTACH, pid_, nullptr, nullptr) < 0) return false;
 
-    tids_ = enumThreads();
-
-    // 附加所有线程
-    for (auto tid : tids_) {
-        if (ptrace(PTRACE_ATTACH, tid, nullptr, nullptr) < 0) continue;
-        int status;
-        if (waitpid(tid, &status, 0) < 0) {
-            ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
-            continue;
-        }
-        if (!WIFSTOPPED(status)) {
-            ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
-        }
+    int status;
+    if (waitpid(pid_, &status, 0) < 0) return false;
+    if (!WIFSTOPPED(status)) {
+        ptrace(PTRACE_DETACH, pid_, nullptr, nullptr);
+        return false;
     }
 
     attached_ = true;
@@ -103,11 +65,7 @@ bool Breakpoint::ptraceDetach() {
     bps_.clear();
     if (!wps_.empty()) { wps_.clear(); clearHwWatchpoints(); }
 
-    // 分离所有线程
-    for (auto tid : tids_) {
-        ptrace(PTRACE_DETACH, tid, nullptr, nullptr);
-    }
-    tids_.clear();
+    ptrace(PTRACE_DETACH, pid_, nullptr, nullptr);
     attached_ = false;
     running_ = false;
     return true;
@@ -215,25 +173,25 @@ std::optional<addr_t> Breakpoint::waitHit() {
 
 std::optional<addr_t> Breakpoint::pollHit() {
     if (!attached_) return std::nullopt;
-    if (!running_) return std::nullopt;
-    if (wps_.empty() && bps_.empty()) return std::nullopt;
+    if (!running_) return std::nullopt;  // 进程停着, 不轮询
+    if (wps_.empty() && bps_.empty()) return std::nullopt; // 没有监控点
 
     int status;
-    // -1 + __WALL: 等待任意已附加线程的事件
-    pid_t ret = waitpid(-1, &status, WNOHANG | __WALL);
+    pid_t ret = waitpid(pid_, &status, WNOHANG);
     if (ret <= 0) return std::nullopt;
+    running_ = false;
 
     if (WIFEXITED(status) || WIFSIGNALED(status)) return std::nullopt;
     if (!WIFSTOPPED(status)) return std::nullopt;
 
     int sig = WSTOPSIG(status);
     if (sig != SIGTRAP) {
-        ptrace(PTRACE_CONT, ret, nullptr, reinterpret_cast<void*>(sig));
+        ptrace(PTRACE_CONT, pid_, nullptr, reinterpret_cast<void*>(sig));
+        running_ = true;
         return std::nullopt;
     }
 
-    // 用触发事件的线程 TID 读寄存器
-    auto regs = getRegs(ret);
+    auto regs = getRegs();
     if (!regs) return std::nullopt;
 
     addr_t hitAddr = regs->pc;
@@ -246,15 +204,11 @@ std::optional<addr_t> Breakpoint::pollHit() {
 // ── 寄存器 ──
 
 std::optional<RegState> Breakpoint::getRegs() const {
-    return getRegs(pid_);
-}
-
-std::optional<RegState> Breakpoint::getRegs(pid_t tid) const {
     if (!attached_) return std::nullopt;
 
     struct { uint64_t regs[31]; uint64_t sp, pc, pstate; } gpr{};
     struct iovec iov = { &gpr, sizeof(gpr) };
-    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(NT_PRSTATUS), &iov) < 0)
+    if (ptrace(PTRACE_GETREGSET, pid_, reinterpret_cast<void*>(NT_PRSTATUS), &iov) < 0)
         return std::nullopt;
 
     RegState state{};
@@ -279,34 +233,25 @@ bool Breakpoint::stopProcess() {
 
     running_ = false;
 
-    // 给进程组发 SIGSTOP (所有线程都会停)
     if (kill(pid_, SIGSTOP) < 0) return false;
 
-    // 收集所有线程的停止事件
-    for (int i = 0; i < (int)tids_.size() + 20; i++) {
+    for (int i = 0; i < 20; i++) {
         int st;
-        pid_t ret = waitpid(-1, &st, __WALL);
-        if (ret < 0) break;
+        if (waitpid(pid_, &st, 0) < 0) return false;
         if (WIFEXITED(st) || WIFSIGNALED(st)) return false;
         if (!WIFSTOPPED(st)) continue;
 
         int sig = WSTOPSIG(st);
-        if (sig == SIGSTOP || sig == SIGTRAP) {
-            // 检查是否主线程已停
-            if (ret == pid_) return true;
-            continue; // 其他线程已停, 继续等主线程
-        }
-        ptrace(PTRACE_CONT, ret, nullptr, reinterpret_cast<void*>(sig));
+        if (sig == SIGSTOP || sig == SIGTRAP) return true;
+
+        ptrace(PTRACE_CONT, pid_, nullptr, reinterpret_cast<void*>(sig));
     }
-    return true; // 尽可能返回 true
+    return false;
 }
 
 void Breakpoint::resumeProcess() {
     if (!attached_ || running_) return;
-    // CONT 所有线程
-    for (auto tid : tids_) {
-        ptrace(PTRACE_CONT, tid, nullptr, nullptr);
-    }
+    ptrace(PTRACE_CONT, pid_, nullptr, nullptr);
     running_ = true;
 }
 
@@ -369,10 +314,10 @@ int Breakpoint::findFreeWatchSlot() {
     return -1;
 }
 
-bool Breakpoint::clearHwWatchpointsForTid(pid_t tid) {
+bool Breakpoint::clearHwWatchpoints() {
     hw_debug_state state{};
     struct iovec iov = { &state, sizeof(state) };
-    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) < 0)
+    if (ptrace(PTRACE_GETREGSET, pid_, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) < 0)
         return false;
 
     int max = state.dbg_info & 0xFF;
@@ -380,21 +325,15 @@ bool Breakpoint::clearHwWatchpointsForTid(pid_t tid) {
 
     size_t len = offsetof(hw_debug_state, dbg_regs) + max * sizeof(state.dbg_regs[0]);
     struct iovec wIov = { &state, len };
-    return ptrace(PTRACE_SETREGSET, tid, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &wIov) >= 0;
+    return ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &wIov) >= 0;
 }
 
-bool Breakpoint::clearHwWatchpoints() {
-    bool ok = true;
-    for (auto tid : tids_) {
-        if (!clearHwWatchpointsForTid(tid)) ok = false;
-    }
-    return ok;
-}
+bool Breakpoint::applyWatchpoints() {
+    if (!attached_) return false;
 
-bool Breakpoint::applyWatchpointsToTid(pid_t tid) {
     hw_debug_state state{};
     struct iovec iov = { &state, sizeof(state) };
-    if (ptrace(PTRACE_GETREGSET, tid, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) < 0)
+    if (ptrace(PTRACE_GETREGSET, pid_, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) < 0)
         return false;
 
     int max = state.dbg_info & 0xFF;
@@ -432,16 +371,7 @@ bool Breakpoint::applyWatchpointsToTid(pid_t tid) {
 
     iov.iov_base = &state;
     iov.iov_len = offsetof(hw_debug_state, dbg_regs) + slotsToWrite * sizeof(state.dbg_regs[0]);
-    return ptrace(PTRACE_SETREGSET, tid, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) >= 0;
-}
-
-bool Breakpoint::applyWatchpoints() {
-    if (!attached_) return false;
-    bool ok = true;
-    for (auto tid : tids_) {
-        if (!applyWatchpointsToTid(tid)) ok = false;
-    }
-    return ok;
+    return ptrace(PTRACE_SETREGSET, pid_, reinterpret_cast<void*>(NT_ARM_HW_WATCH), &iov) >= 0;
 }
 
 bool Breakpoint::watchAdd(addr_t addr, size_t size, WatchpointInfo::Mode mode) {
